@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-rd-variant="refined">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- theme-color 跟着 DSH 走：深色 #151517（bg-base），浅色 #fff。
+         父页面改主题时会用 postMessage 同步改这里的 content。 -->
+    <meta name="theme-color" content="#151517" />
+    <title>画布</title>
+    <script>
+      /*
+       * 首帧锁深色 + 锁视觉方案 —— 与上游 index.html 的两段内联脚本同一决策。
+       *
+       * 必须在 <head> 里同步执行：放到入口模块里做，Vue 挂载前那一帧会先用
+       * 浅色变量渲染一遍，右栏里能看到一次闪白。
+       *
+       * `data-rd-variant=refined`（克制高级版：纯净中性、无纹理）是上游默认值。
+       * 那段逻辑还有 `?rd=pixel` 的复古分支（扫描线 + 点阵标签），
+       * 我们的页面不暴露它 —— 右栏只有几十像素宽，纹理只会糊成一团。
+       */
+      document.documentElement.dataset.theme = 'dark';
+
+      /*
+       * 上面锁的是**画布本体**的深色（上游产品决策，不能动）。
+       * 下面这段锁的是**壳层**的 color-scheme，必须跟着 DSH 走 —— 它决定滚动条
+       * 和原生控件的配色，属于壳层不属于画布。
+       *
+       * 为什么要在这里再读一次 `?theme`：dsh-bridge.ts 是 ES 模块，要等下载 +
+       * 解析 + 求值才跑得到；在此之前 html 上还没有 `data-dsh-theme`，
+       * `dsh-shell.css` 里那条 `html { color-scheme: light }` 会先生效，
+       * 于是 DSH 深色下会闪一下浅色滚动条。URL 参数是父页面写好的，
+       * 首帧就能读到，不必等桥。
+       */
+      (function () {
+        try {
+          var theme = new URLSearchParams(location.search).get('theme');
+          document.documentElement.dataset.dshTheme = theme === 'light' ? 'light' : 'dark';
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute('content', theme === 'light' ? '#ffffff' : '#151517');
+        } catch (e) {
+          document.documentElement.dataset.dshTheme = 'dark';
+        }
+      })();
+    </script>
+    <!--
+      传输层必须在入口模块**之前**执行：它要抢先占住 `window.nexusvaultMcp`，
+      然后画布挂载时自己会调 `window.nexusvaultMcp?.onCommand(...)` 把处理器
+      交进来（见 CanvasView.vue 顶部的 `declare global`）。顺序反了，
+      画布看到的 `nexusvaultMcp` 就是 undefined，命令一条也进不来。
+
+      内容由 vite.config.mjs 的 inline-canvas-transport 插件在这里原样注入 ——
+      源文件是 `lib/embed/canvas-transport.js`，**不是**从这里复制一份。
+      走内联而不是 `<script src>`：少一次请求，且彻底没有「base 是 `./` 时
+      这个路径怎么解析」的变数。
+    -->
+    <!--@canvas-transport-->
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

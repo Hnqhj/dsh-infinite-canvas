@@ -1,0 +1,4 @@
+# 只插入本插件自己的 loader 行，不替换任何官方 DSH 组件。
+- insert:
+    - id: infinite-canvas
+      name: dsh-infinite-canvas

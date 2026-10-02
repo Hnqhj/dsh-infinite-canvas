@@ -1,0 +1,1534 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   DSH 内嵌壳层补丁 —— 故意放在整条样式级联的**最后**。
+
+   分三段：
+     ① 必需：把高度链接通、把滚动权收到 #app 上；
+     ② 主题：color-scheme 跟随 DSH 三态 + 接住父页面送来的 --dsw-* token；
+     ③ 适配：窄容器排版。
+
+   上游的画布页自己只写 `height: 100%`（见 canvas-flow.css 的 `.canvas-page`），
+   那条百分比能不能生效**取决于祖先链上有没有确定高度**。在上游应用里那段高度
+   由 `AppLayout.vue` 提供：`html → body → #app → .app-layout → 主区`一路
+   `height: 100%`。我们这里没有 AppLayout，链子断在 `#app` ——
+   而 `style.css` 只写了 `html, body, #app { min-height: 100% }`
+   （min-height 的百分比在父级高度为 auto 时按规范退化成 auto）。
+
+   后果不是「矮一点」而是**塌成 0 高**：画布的内容几乎全是绝对定位
+   （stage / 工具条 / 面板 / Vue Flow 的 viewport），撑不起父级，
+   于是整屏空白，只看到一圈点阵。
+
+   不碰任何画布自己的类名 —— 观感必须来自上游那 33 份样式表。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  /* 画布页自己会铺满，body 再滚就会露出底下 style.css 给 body 设的底色 */
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
+  min-height: 0;
+  /* 画布恰好 100% 高，不会触发滚动条；画布项目页（内容可超过一屏）靠这里滚。
+     用 #app 而不是 body 承接滚动：body 滚动会给 sticky 页头带来额外的参照系。 */
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/* 上游产品决策：画布**始终是深色**（见 canvas-flow.css「画布页为什么始终是深色」），
+   与站点主题无关。
+
+   但 `color-scheme` 是**壳层**的东西，不属于画布本体：它决定滚动条、滚动锚点、
+   表单控件的 resize grip、以及 focus 环的默认配色走哪一套。跟着主题走，
+   DSH 切浅色时右侧栏里不会出现一条刺眼的白滚动条。
+
+   画布本体的配色不受影响 —— 它由上游那 33 份样式表里的类名决定，
+   这里只管 UA 控件这一层。 */
+html {
+  color-scheme: light;
+}
+
+html[data-dsh-theme='dark'] {
+  color-scheme: dark;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DSH token 桥
+   ───────────────────────────────────────────────────────────────────────────
+   父页面（插件的 client.js）把 DSH **已解析**的 token 用 postMessage 送过来，
+   `dsh-bridge.ts` 写在 :root 上。官方文档说得很直接：
+   「token 样式表是颜色值的唯一权威来源，设计系统中缺失的值会有意不补入」——
+   所以这里一律用 `var(--dsw-*, 兜底)`，不自己复刻一套色值。
+
+   ⚠️ **兜底必须给 static 层，不能只给 alias 层。**
+   DSH 的 token 是两层：`--dsw-alias-*` 的值是 `var(--dsw-static-*)` **引用**，
+   `--dsw-static-*` 才是字面量。只声明 alias 时，那条 `var()` 必然断链，
+   于是 `background: var(--dsw-alias-bg-layer-1)` **整条声明失效**。
+
+   实测（`.workbuddy/verify/probe-var-chain.mjs`）：
+     两层都在           → rgb(255, 255, 255)   ✓
+     只给 alias         → rgba(0, 0, 0, 0)     声明被丢弃
+     只给 alias + 兜底   → rgb(21, 21, 23)      吃兜底 = 看着像"主题桥没生效"
+
+   父页面已改成两层都送（`STATIC_TOKEN_NAMES` 整层 77 个），所以正常路径下
+   这里的兜底根本不会被读到；它只在**桥没生效**时起作用 —— 比如独立打开
+   embed 页调试、或将来 DSH 改了 token 命名。留着的意义是：宁可退回一个
+   明确且自洽的深色，也不要半途断链。
+
+   用到的地方只有壳层：窄容器下被抬高的三组工具条、选区色。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── static 层（字面量，必须先有，alias 才能解析） ── */
+  --dsw-static-neutral-bluish-00: #fff;
+  --dsw-static-neutral-bluish-50: #f9fafb;
+  --dsw-static-neutral-bluish-60: #f5f6f7;
+  --dsw-static-neutral-bluish-100: #ebeef2;
+  --dsw-static-neutral-bluish-1000: #0f1115;
+  --dsw-static-neutral-bluish-150: #e9ecf2;
+  --dsw-static-neutral-bluish-200: #e1e5ee;
+  --dsw-static-neutral-bluish-300: #cfd3d6;
+  --dsw-static-neutral-bluish-400: #adb2b8;
+  --dsw-static-neutral-bluish-500: #979da6;
+  --dsw-static-neutral-bluish-600: #81858c;
+  --dsw-static-neutral-bluish-700: #61666b;
+  --dsw-static-neutral-bluish-750: #43454a;
+  --dsw-static-neutral-bluish-800: #353638;
+  --dsw-static-neutral-bluish-850: #2c2c2e;
+  --dsw-static-neutral-bluish-875: #232324;
+  --dsw-static-neutral-bluish-900: #1b1b1c;
+  --dsw-static-neutral-bluish-950: #151517;
+  --dsw-static-deepseek-400: #7aaaff;
+  --dsw-static-deepseek-500: #4176e6;
+  --dsw-static-blue-500: #3b82f6;
+
+  /* ── alias 层（引用上面的 static，与 DSH 的写法同构） ── */
+  --dsw-alias-bg-base: var(--dsw-static-neutral-bluish-950);
+  --dsw-alias-bg-layer-1: var(--dsw-static-neutral-bluish-875);
+  --dsw-alias-bg-layer-2: var(--dsw-static-neutral-bluish-850);
+  --dsw-alias-bg-layer-3: var(--dsw-static-neutral-bluish-800);
+  --dsw-alias-label-primary: var(--dsw-static-neutral-bluish-50);
+  --dsw-alias-label-secondary: var(--dsw-static-neutral-bluish-300);
+  --dsw-alias-label-tertiary: var(--dsw-static-neutral-bluish-400);
+  --dsw-alias-border-l1: #ffffff0f;
+  --dsw-alias-border-l2: #ffffff1f;
+  --dsw-alias-border-l3: #ffffff29;
+  --dsw-alias-state-business-primary: var(--dsw-static-deepseek-400);
+
+  /* 圆角尺度：xs 4 / sm 8 / md 12。
+     ⚠️ 官方 token 表里**没有任何 radius token**（`grep radius` 命中 0），
+     这三个值是按 DSH 控件的实测观感定的，所以前缀用 `--canvas-*`
+     而不是冒用 `--dsw-*` —— 否则半年后没人分得清哪条是官方规范。
+     实测值来自 dsh-client-ui-theme 的 `corner-shape: superellipse(1.5)`
+     与按钮/输入框的实际 computed 值。 */
+  --canvas-radius-xs: 4px;
+  --canvas-radius-sm: 8px;
+  --canvas-radius-md: 12px;
+
+  /* 官方焦点环：浅 #4176E6 / 深 #7AAAFF，标准宽度 2px。 */
+  --dsw-focus-ring-color: var(--dsw-static-deepseek-500);
+  --dsw-focus-ring-width: 2px;
+  /* 本插件自定的浮起阴影（DSH 官方 190 个 token 里没有任何 shadow/elevation，
+     唯一的 "elevated" 是 `--dsw-alias-button-elevated-fill`，那是填充色）。
+     变量前缀用 `--canvas-*` 而不是 `--dsh-*`：后者在这个仓库里是 DSH 官方的
+     几何/字号前缀，混进去会让人误以为是官方的。详见 §工具条那节。 */
+  --canvas-shadow-float: 0 2px 8px rgba(0, 0, 0, 0.24);
+}
+
+/* 浅色下的兜底同样要给**三层**。
+   DSH 浅色里 layer-1 是白、layer-2 是 #f5f6f7、layer-3 才是 #ebeef2；
+   若沿用深色那套"三层逐渐变浅"的直觉，浅色下 layer-1 与 layer-3 会都变成白，
+   按钮的悬停/按下反馈就**完全看不见**（实测容易漏）。 */
+html[data-dsh-theme='light'] {
+  --dsw-alias-bg-base: var(--dsw-static-neutral-bluish-00);
+  --dsw-alias-bg-layer-1: var(--dsw-static-neutral-bluish-00);
+  --dsw-alias-bg-layer-2: var(--dsw-static-neutral-bluish-60);
+  --dsw-alias-bg-layer-3: var(--dsw-static-neutral-bluish-100);
+  --dsw-alias-label-primary: var(--dsw-static-neutral-bluish-1000);
+  --dsw-alias-label-secondary: var(--dsw-static-neutral-bluish-700);
+  --dsw-alias-label-tertiary: var(--dsw-static-neutral-bluish-600);
+  --dsw-alias-border-l1: #0000000a;
+  --dsw-alias-border-l2: #0000001a;
+  --dsw-alias-border-l3: #0000001f;
+  --dsw-alias-state-business-primary: var(--dsw-static-deepseek-500);
+  --dsw-focus-ring-color: var(--dsw-static-deepseek-500);
+  /* 浅色底是白的，同一个深色阴影会变成一团墨 —— 峰值降到 6%。
+     两段式（贴地 2px + 抬升 6px）比一段大模糊干净：前者给接触感，后者给悬浮感。 */
+  --canvas-shadow-float: 0 1px 2px rgba(15, 17, 21, 0.05), 0 6px 16px rgba(15, 17, 21, 0.06);
+}
+
+/* 选区：官方在两种主题里都用 40% 不透明度的 blue-500，
+   目的是「保留文档原色的选区」，所以这里不跟随主题变色。 */
+::selection {
+  background: color-mix(in srgb, var(--dsw-static-blue-500) 40%, transparent);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   窄容器适配
+   ───────────────────────────────────────────────────────────────────────────
+   上面那几行高度声明是**必需**的；这一段是**适配**的。
+
+   上游画布是给整屏窗口写的，三处布局在窄容器下会坏 —— 而 DSH 的右侧栏只有
+   400~520px 宽，正好落在坏掉的那一档。实测（.workbuddy/verify/shot.mjs，
+   1440 视口下量不到问题，520 / 440 下都复现）：
+
+   ① 底部三组工具条互相压叠
+      `.ref-bottom-left` / `.ref-create-bar` / `.ref-bottom-right` 全都坐在
+      `bottom: 14px` 同一行，靠 左 / 居中 / 右 三种定位各自躲开。
+      实测内容净宽 116 + 190 + 275 = 581px，加上三处 18px 外边距约 617px ——
+      **视口窄于约 660px 就必然重叠**（520px 下右条从 227px 起，
+      与中条的 165~355px 直接压在一起，「100%」被网格图标盖住）。
+
+   ② 空态引导的按钮被压成竖排
+      `.canvas-empty-guide` 是 `position: absolute; left: 50%` 且**没给 right**。
+      绝对定位的 shrink-to-fit 把「可用宽度」算成「从 left 到容器右缘」，
+      也就是**视口的一半** —— 520px 时可用 260px，而三个按钮的自然宽度
+      （14px 内边距×2 + 图标 + 7px 间距 + 四字文案）约 99px，共 313px。
+      放不下就触发 flex 收缩，按钮被压到 65px，文字逐字换行、互相叠。
+      上游在 ≥740px 的窗口里碰不到这个坑。
+
+   下面只改**布局**，不改视觉：颜色、圆角、边框、字号、图标、交互全部沿用上游，
+   断点以下只是把三组工具条换成两行、给引导框一个能容下内容的宽度。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@media (max-width: 760px) {
+  /* ① 工具条改两行。
+   *
+   * 分工按「谁更重要」排：创建条（导入 / 生成 / 创作板 / 文本 / 涂鸦）是画布的
+   * 主入口，和左边的资产库 / 积分放在**上排**；右边那条约 275px 的工具条
+   * （模型胶囊 + 缩放 + 五个视图开关）内容最多，**独占下排**靠右。
+   *
+   * 中条要放弃 `left:50% + translateX(-50%)` 换成 `right` 定位 —— 居中会和
+   * 左条在 400px 档撞上（116 + 190 = 306，两侧外边距一加就到 340，
+   * 而右条还要 275，三者同排至少要 617）。
+   *
+   * 断点定**760** 而不是「看起来差不多」的数：单排布局的真实门槛是让中条右缘
+   * 与右条左缘不相遇，即 `视口 − 18 − 275 ≥ 中条右缘`；中条居中故右缘
+   * `= 视口/2 + 95`，解出 **视口 ≥ 738**。留一点余量取 760。
+   *
+   * 注意：这里**只管布局**。工具条的底色/描边/圆角在断点**之外**统一给
+   * （见文件末尾「按钮与工具条：按 DSH 控件规范重置」一节）——
+   * 上一版把配色写在这个断点里，结果 1080px 宽的 DSH 右栏完全吃不到，
+   * 工具条一直是上游原样。
+   */
+  .canvas-page .ref-bottom-left {
+    left: 10px;
+    bottom: 70px;
+  }
+
+  .canvas-page .ref-create-bar {
+    left: auto;
+    right: 10px;
+    bottom: 70px;
+    transform: none;
+    gap: 2px;
+    padding: 0 8px;
+  }
+
+  .canvas-page .ref-bottom-right {
+    left: 10px;
+    right: 10px;
+    bottom: 14px;
+    /* 撑满整行再靠右对齐：内容宽度随视口变，但视觉上仍然贴右。 */
+    justify-content: flex-end;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  /* 缩放百分比那格原本 `min-width: 44px`，窄容器里没必要占那么宽。 */
+  .canvas-page .ref-bottom-right span {
+    min-width: 34px;
+  }
+
+  /* ② 引导框：解掉 shrink-to-fit 陷阱。
+   *
+   * `width: max-content` 让它按内容宽度定尺寸，不再受「left 到容器右缘」那条
+   * 可用宽度约束；`max-width` 只在极窄容器（< 约 340px）才起作用。
+   */
+  .canvas-page .canvas-stage .canvas-empty-guide {
+    width: max-content;
+    max-width: calc(100vw - 24px);
+  }
+
+  /* 按钮不许被 flex 收缩 —— 一旦收缩，中文文案就会逐字换行。 */
+  .canvas-page .canvas-stage .canvas-empty-guide .canvas-empty-actions button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 520px) {
+  /* 三个按钮一行放不下时换行，而不是压扁。 */
+  .canvas-page .canvas-stage .canvas-empty-guide .canvas-empty-actions {
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   按钮与工具条：按 DSH 官方控件规范重置视觉
+   ───────────────────────────────────────────────────────────────────────────
+   **放在断点之外**，全宽度生效。
+
+   ⚠️ 上一版把这些配色写在了 `@media (max-width: 760px)` 里 ——
+   而 DSH 右栏在 1080px 窗口下有 600+px 宽，**那条断点根本不匹配**，
+   于是工具条一直是上游原样。教训：**断点只管布局，配色不要放进去**。
+
+   用到的 DSH 规范（实测自 app.asar 的 dsh-client-ui-theme）：
+     · 圆角尺度 radius-xs 4 / sm 8 / md 12 / lg 16 / panel 28
+     · 描边用 border-l1（浅 `#0000000a` / 深 `#ffffff0f`）——官方管这叫"发丝描边"
+     · 焦点环 `--dsw-focus-ring-color` + `--dsw-focus-ring-width: 2px`
+     · 交互底色用 `--dsw-alias-bg-layer-1/2`，文字用 label-primary/secondary
+   按用户拍板：**只重置视觉**（颜色/圆角/描边/字号），不重排结构、不换图标。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 浮起阴影：用上面 `:root` / `html[data-dsh-theme='light']` 里定义的
+   `--canvas-shadow-float`（深浅两套值）。
+   为什么必须分主题、为什么变量不叫 `--dsw-*`，见上面那两处的注释。 */
+
+/* ── 底部中间的创建条：唯一保留「浮岛」的一组 ──
+   上游给它写了实心底 `#22242b` + 描边 + 圆角 15px + `box-shadow: 0 8px 30px #0007`
+   （47% 黑，为深底设计）。它在 DSH 浅色下是一团墨 —— P2.6 已把阴影收成
+   `--canvas-shadow-float`（浅色峰值 6%），底色改成 layer-1 + 发丝描边。
+   这一组是画布的主入口（导入 / 生成 / 创作板 / 文本 / 涂鸦），浮岛让它
+   在视觉上锚定「主操作」，所以浮岛样式**保留**。 */
+.canvas-page .ref-create-bar {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-sm);
+  box-shadow: var(--canvas-shadow-float);
+  box-sizing: border-box;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+/* ── 左下 / 右下：裸按钮簇，不要浮岛 ──
+   用户拍板：「左下角和右下角的图标按钮功能不要浮岛样式，底部中间的保持不变」。
+
+   这其实是**回到上游的本意**，不是新设计。上游 `canvas-chrome.css` 947 / 964 行
+   原文写的是 `background: transparent`，注释也写着「与右下角同款：透明底、
+   按钮簇直接坐画布上」—— 左右两组本来就是**裸图标钮**，只有中条是浮岛。
+   P2.5 那一轮把三组统一成了同权重的 layer-1 + 描边 + 圆角 + 阴影，
+   等于给裸按钮簇套了三个白盒子：既多了一层没必要的框，
+   又让「主入口 / 次级工具」的层级差被抹平了。
+
+   这里显式把容器打回透明 + 无描边 + 无阴影，**只保留按钮自身的
+   hover / 激活反馈** —— 交互态是功能的一部分，容器外观不是。 */
+.canvas-page .ref-bottom-left,
+.canvas-page .ref-bottom-right {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* ── 工具条内的按钮 ──
+   上游靠 `color: #9ba1ae` 这类硬编码上色；改成 token 后跟随主题。
+   悬停按官方 elevation 习惯：底色升到 layer-2。 */
+.canvas-page .ref-bottom-left button,
+.canvas-page .ref-create-bar button,
+.canvas-page .ref-bottom-right button {
+  color: var(--dsw-alias-label-secondary);
+  border-radius: var(--canvas-radius-xs);
+  transition: background 120ms ease, color 120ms ease;
+}
+
+/* 按钮里的小标签（积分数字等）。
+   上游用 `.ref-bottom-left .credits-trigger b { color: #f0f1f4 }` 写死浅色 ——
+   光给 `button` 上色**管不到它**：`b` 有自己的颜色声明，而颜色不从父按钮继承。
+   浅色下就是「白底 + 近乎白的字」，实测对比度 1.13。
+   逐个点名，别指望继承。 */
+.canvas-page .ref-bottom-left :is(b, strong, i, em, span) {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.canvas-page .ref-bottom-left .credits-trigger b {
+  color: var(--dsw-alias-label-primary);
+}
+
+.canvas-page .ref-create-bar button:hover {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 左/右的按钮直接坐在画布上（容器透明），底色随画布走 ——
+   所以 hover 不能用 `bg-layer-2` 这个**实心**层（浅色下 #f5f6f7 压在纯白
+   `bg-base` 上几乎看不见），要用官方那个专门给「透明底上叠一层」的
+   半透明交互色 `interactive-bg-hover`（浅 `#2631480f` / 深 `#ffffff14`）。
+   它是 alpha 色，叠在任何底色上都成立 —— 这正是它存在的意义。 */
+.canvas-page .ref-bottom-left button:hover,
+.canvas-page .ref-bottom-right button:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 激活态同理，比 hover 再实一档（`interactive-bg-active`）。 */
+.canvas-page .ref-create-bar button[aria-pressed='true'] {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.canvas-page .ref-bottom-left button[aria-pressed='true'],
+.canvas-page .ref-bottom-right button.is-on,
+.canvas-page .ref-bottom-right button[aria-pressed='true'] {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-active);
+}
+
+/* 焦点环用 DSH 官方的两段式：颜色 + 宽度，样式交给浏览器默认 outline。
+   上游的按钮没有可见焦点态，键盘用户在这张画布上是迷路的。 */
+.canvas-page :is(button, input, [tabindex]):focus-visible {
+  outline: var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, #4176e6);
+  outline-offset: 1px;
+}
+
+/* 顶栏同理 */
+.canvas-page .ref-topbar {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   画布浅色化 · 第一层：底层
+   ───────────────────────────────────────────────────────────────────────────
+   上游 `canvas-editorial.css` 有 `.canvas-stage { background: #121212 }`、
+   `canvas-flow.css` 有 `.canvas-page { background: #121212; color: #e9eaf0 }`。
+   **这不是刻意的产品决策** —— 上游自己在 `canvas-flow.css` 的注释里写了：
+
+     「迁移时保持了这个行为……但它确实是历史遗留而非刻意设计，
+       若要跟随主题只需删掉那一段的 background 覆盖。」
+
+   所以浅色化是**修历史遗留**，不是推翻设计决策。本节按用户拍板的
+   「分层覆盖：先底层后细节」实现 —— 本节只处理影响体感的底层
+   （底色 / 文字 / 面板 / 工具条 / 点阵 / 滚动条），
+   节点卡、彩色标签、涂鸦等细节留给第二层。
+
+   做法用 `[data-dsh-theme='light']` 而不是 `[data-theme='light']`：
+   后者是上游的锁（首帧被内联脚本钉成 dark），我们不去碰它；
+   `data-dsh-theme` 才是本插件自己写的、跟随 DSH 的那个属性。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+html[data-dsh-theme='light'] .canvas-page,
+html[data-dsh-theme='light'] .canvas-page .canvas-stage {
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 点阵：Vue Flow 的 Background 组件用 inline style 画 SVG 圆点，
+   颜色由 CSS 变量喂。深色下用 bluish-800，浅色下换 bluish-200 ——
+   这是官方色阶里同一档位的深浅两值。 */
+html[data-dsh-theme='light'] .canvas-page .vue-flow__background pattern circle {
+  fill: var(--dsw-static-neutral-bluish-200);
+}
+
+/* 画布内的滚动条：官方 WebKit 路径宽 5px，滑块读 alias-scrollbar-*。
+   这里给一份浅色下的兜底（桥未生效时也能看）。 */
+html[data-dsh-theme='light'] .canvas-page ::-webkit-scrollbar {
+  width: 5px;
+}
+
+html[data-dsh-theme='light'] .canvas-page ::-webkit-scrollbar-thumb {
+  background: var(--dsw-alias-border-l3);
+  border-radius: 999px;
+}
+
+/* ── 阴影：两个主题都收一档 ──
+   上游给浮起容器写的是**为深底设计**的大模糊黑：
+     `.floating-panel`      0 14px 45px #0009  （60% 黑）
+     `header` / 生成面板     0 18px 55px #000a  （67% 黑）
+     `.ref-create-bar`     0 8px 30px #0007   （47% 黑）
+   深色底上这种强度勉强能看，但它同时有两个副作用：
+     ① 浅色下变成一团墨（用户反馈的「阴影太重」）；
+     ② 即使在深色下，60% 的大模糊也会让面板边缘糊掉、失去发丝描边。
+   所以统一换成 `--canvas-shadow-float`（见文件开头的两处定义）。
+   注意工具条三组的合并规则在浅色覆盖层**之前**、深浅都生效，
+   这里只补浮层面板与引导框。 */
+.canvas-page .floating-panel,
+.canvas-page .canvas-empty-guide {
+  box-shadow: var(--canvas-shadow-float);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   浮层面板 · 第二层：把 7 个面板的**内部构件**也全部浅色化
+   ───────────────────────────────────────────────────────────────────────────
+   上一节只做了「面板外壳」。用户反馈「控件的颜色怎么还没改」——
+   截图里那个生成面板（`.generate-panel`）从外壳到内部全是深色。
+
+   ⚠️ **为什么上一轮漏了整整一层**（这是本项目最贵的一个教训）：
+   上一轮的对比度扫描报「8 个文字元素，无低于 1.5 的」，那个结论**是真的**，
+   但它只覆盖了**默认打开时在 DOM 里**的东西：空态引导 + 三组工具条。
+   7 个面板全是 `v-if` 渲染，**默认一个都不在 DOM 里**，扫描天然扫不到。
+   于是「扫描全绿」被误读成「浅色化做完了」。
+
+   **教训：验收扫描必须先把目标「打开」再扫。**
+   不打开就扫 = 只验了默认可见的那一层，漏掉按需渲染的全部内容。
+   现在有 `.workbuddy/verify/scan-panels.mjs` 逐个点开 7 个面板再扫，
+   覆盖 113 个元素（vs 上一轮的 8 个）。
+
+   组织方式：**按面板分组，组内先容器后构件**。不用「一层铺 20 条规则」的方式，
+   因为那样出问题时无法判断是哪一处、也容易漏掉同类。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 浅色下的通用替换（多数面板构件都是「深底 + 白字」的同一套值）：
+     上游 #1b1d22/#23262e/#2a2d36/#33363e 这几个色是同一档深灰，
+     分别对应「卡片底 / 卡片描边 / 图标瓦片 / 按钮底」，
+     浅色下对应 DSH 的 layer-2 / border-l2 / layer-2 / layer-2。 */
+html[data-dsh-theme='light'] .canvas-page :is(
+    .generate-panel,
+    .floating-panel
+) {
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-md);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+/* 面板 header：上游 `#22242b` + 自己的 `0 18px 55px #000a` 大模糊。 */
+html[data-dsh-theme='light'] .canvas-page .floating-panel header,
+html[data-dsh-theme='light'] .canvas-page :is(.generate-panel, .floating-panel) :is(header, footer) {
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  border: 0;
+  box-shadow: none;
+}
+
+/* 面板内的次级文字。逐个点名而不是 `:is()` 泛化 ——
+   泛化会漏掉那些**有自己 class** 的文字（下面几个就是例子）。 */
+html[data-dsh-theme='light'] .canvas-page :is(.floating-panel, .generate-panel) :is(
+    .panel-subtitle,
+    .panel-empty,
+    .library-item small,
+    .library-placeholder,
+    .generate-aspect
+) {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ── 面板 1：生成面板（`.generate-panel`） ──
+   唯一**不带** `.floating-panel` 类的一个，所以第一轮的
+   `.floating-panel` 覆盖完全没碰到它 —— 这是漏掉它的直接原因。 */
+html[data-dsh-theme='light'] .canvas-page .generate-icon {
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-secondary);
+  border-radius: var(--canvas-radius-sm);
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-panel textarea {
+  color: var(--dsw-alias-label-primary);
+  background: transparent;
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-panel textarea::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 底部那排胶囊：媒体 / 模型 / 积分。上游 `#1b1d22` + `#33363e`。
+   用官方 `button-floating-fill`（浅=bluish-00 白 / 深=bluish-850）
+   而不是 bg-layer —— 官方给「浮在内容之上的按钮」准备的就是这个 token，
+   语义比"第几层"更准。 */
+html[data-dsh-theme='light'] .canvas-page .generate-pill,
+html[data-dsh-theme='light'] .canvas-page .generate-cost {
+  background: var(--dsw-alias-button-floating-fill);
+  border: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-secondary);
+  border-radius: var(--canvas-radius-sm);
+}
+
+/* 胶囊里的模型名（`<b>GPT Image 2.5</b>`）—— 与 `.credits-trigger b` 同病：
+   颜色不从父胶囊继承，它自己写死了 `#f0f1f4`。 */
+html[data-dsh-theme='light'] .canvas-page .generate-pill b {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-cost {
+  color: var(--dsw-alias-label-primary);
+  border-radius: 999px;
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-pill:hover {
+  background: var(--dsw-alias-button-floating-hover);
+  border-color: var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 提交按钮：上游是白底深字（`#f0f0f0` / `#26282e`），
+   浅色下白底白底 —— 靠 DSH 的品牌蓝当主色，符合官方主按钮惯例。 */
+html[data-dsh-theme='light'] .canvas-page .generate-submit {
+  background: var(--dsw-alias-state-business-primary);
+  color: #ffffff;
+  border-radius: 50%;
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-submit:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 88%, #000000);
+}
+
+/* 模型下拉（从底部条向上展开的那块）*/
+html[data-dsh-theme='light'] .canvas-page .generate-model-menu {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-md);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-model-tabs {
+  background: var(--dsw-alias-bg-layer-2);
+  border-radius: var(--canvas-radius-sm);
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-model-tabs button {
+  color: var(--dsw-alias-label-secondary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-model-tabs button.active {
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-model-option {
+  color: var(--dsw-alias-label-primary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-model-option:hover {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 选中态上游只有一句 `color: #fff`，**没有自己的底色** —— 它透出的是后面
+   的菜单白底。也就是说：选中当前模型时，那一行文字会直接消失（鼠标不悬
+   停就看不见），只剩一个蓝色对勾浮在那儿。所以这里既要补选中底，也要把
+   白字换掉 —— `#fff` 是为深底写的，透到白底上等于没有。
+   用 interactive-bg-active（浅色 alpha 深灰）而不是实心灰：菜单是浮层,
+   实心底容易和下面的 bg-layer-1 糊成一片。 */
+html[data-dsh-theme='light'] .canvas-page .generate-model-option.selected {
+  background: var(--dsw-alias-interactive-bg-active);
+  color: var(--dsw-alias-label-primary);
+}
+html[data-dsh-theme='light'] .canvas-page .generate-model-option.selected:hover {
+  background: var(--dsw-alias-interactive-bg-active);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-model-dot {
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .generate-model-check {
+  color: var(--dsw-alias-state-business-primary);
+}
+
+/* ── 面板 2/3：资产库与素材（共用网格卡片） ── */
+html[data-dsh-theme='light'] .canvas-page .library-item {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-sm);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .library-item:hover:not(:disabled) {
+  background: var(--dsw-alias-bg-layer-2);
+  border-color: var(--dsw-alias-border-l2);
+}
+
+html[data-dsh-theme='light'] .canvas-page .library-item:disabled {
+  opacity: 0.55;
+}
+
+/* 缩略图占位框：上游 `#141519`。浅色下不能纯白（会与卡片底糊在一起），
+   用 layer-2 才看得出「这里会放图」。 */
+html[data-dsh-theme='light'] .canvas-page .library-preview {
+  background: var(--dsw-alias-bg-layer-2);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .library-name {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* ── 面板 4：涂鸦（`.doodle-panel`，横向一条） ──
+   上游按钮底 `#33363e`，笔刷色板是 `i` + 内联 background（那是**笔迹颜色**，
+   属于内容色，不该跟着主题变 —— 只把选中圈从白改成品牌蓝，
+   否则浅色下白圈等于看不见）。 */
+html[data-dsh-theme='light'] .canvas-page .doodle-panel button {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .doodle-panel button:hover {
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 「完成」按钮用品牌色，规则在下面「深色修正」那节的 `[data-dsh-theme]` 通配版里。 */
+
+html[data-dsh-theme='light'] .canvas-page .doodle-panel i {
+  border-color: var(--dsw-alias-border-l2);
+}
+
+html[data-dsh-theme='light'] .canvas-page .doodle-panel i.selected {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 2px;
+}
+
+/* 笔刷粗细滑杆：上游 `.input` 走的是全局 `input` 规则。 */
+html[data-dsh-theme='light'] .canvas-page .doodle-panel input {
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-xs);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* ── 面板 5：快捷键 ── */
+html[data-dsh-theme='light'] .canvas-page .shortcuts-panel p {
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* ── 面板 6：设置 ── */
+html[data-dsh-theme='light'] .canvas-page .settings-panel p {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel p small,
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-head small,
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-name small {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-block {
+  border-top-color: var(--dsw-alias-border-l1);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-head {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-save input {
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-primary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-save input::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-save button {
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-primary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-name {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-primary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-name:hover {
+  background: var(--dsw-alias-bg-layer-2);
+  border-color: var(--dsw-alias-border-l2);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-del {
+  border: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-tertiary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel .snapshot-del:hover {
+  color: var(--dsw-alias-state-error-primary);
+  border-color: var(--dsw-alias-border-l2);
+}
+
+/* 开关：上游 `#eee` 底 + `#333` 圆点。浅色下要用 bg-layer-3 才看得出轨道；
+   圆点用官方 `switch-thumb`。 */
+html[data-dsh-theme='light'] .canvas-page .settings-panel p .switch {
+  background: var(--dsw-alias-bg-layer-3);
+  border: 1px solid var(--dsw-alias-border-l1);
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel p .switch.on {
+  background: var(--dsw-alias-state-business-primary);
+  border-color: transparent;
+}
+
+html[data-dsh-theme='light'] .canvas-page .settings-panel p .switch:after {
+  background: var(--dsw-alias-switch-thumb);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   深色下的三处修正（实测 `scan-panels.mjs --theme=dark` 抓出来的）
+   ───────────────────────────────────────────────────────────────────────────
+   浅色化做了两轮之后，**深色下反而被漏了**——因为前两轮的判据是
+   「lum < 0.35 = 深色残留」，那个判据在深色主题下会把正常的深底全报成问题，
+   于是我第一版扫描器跑深色时输出 35 处「问题」，全是噪音 → 真问题被淹没。
+   判据修正为「随主题反转」之后，深色下暴露出这 3 处**上游的浅色硬编码**：
+
+     ① `.generate-submit`  `#f0f0f0` → 深底上一个刺眼白圆
+     ② `.doodle-panel button:last-child` 同上（「完成」按钮）
+     ③ `.settings-panel p .switch`  `#eee` → 深底上两条亮杠
+
+   以及一处**两个主题都错**的（不是深浅问题，是它本身就灰得看不见）：
+
+     ④ `.settings-panel p .danger`  `rgba(180,180,180,.12)` 底 + `#c8c8c8` 字
+        实测对比度 **1.24**，两个主题下都远低于 1.5。它是破坏性操作按钮，
+        按 DSH 规范该用 `state-error-primary`（官方 token 里**没有** `state-danger`）。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ① 主操作按钮（生成面板的圆形提交键）。
+
+   ⚠️ 第一版这里用了 `button-contrast-fill`，深色下解析成 `bluish-50` = 近白
+   `rgb(249,250,251)` —— 深底上一个近白圆**非常刺眼**，而且它是"主操作"，
+   官方深色的主按钮是品牌色不是白色（`button-primary-fill` → `brand-primary`）。
+
+   两主题统一用 `state-business-primary`（浅 #4176e6 / 深 #7aaaff）：
+   主色在两个主题下都成立，深色下也足够跳。
+   `button-contrast-fill` 的正确用途是**深底上的次要强调**
+   （比如深色下的开关轨道），不是主按钮。 */
+html[data-dsh-theme] .canvas-page .generate-submit {
+  background: var(--dsw-alias-state-business-primary);
+  color: #ffffff;
+}
+
+html[data-dsh-theme] .canvas-page .generate-submit:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 86%, #000000);
+}
+
+/* ② 「完成」按钮：与主操作按钮同权重（两主题都用品牌色）。 */
+html[data-dsh-theme] .canvas-page .doodle-panel button:last-of-type {
+  background: var(--dsw-alias-state-business-primary);
+  color: #ffffff;
+}
+
+/* ③ 开关轨道：深色下用 layer-2 才看得出轨道（layer-1 与面板同色会消失）。 */
+html[data-dsh-theme='dark'] .canvas-page .settings-panel p .switch {
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+}
+
+html[data-dsh-theme='dark'] .canvas-page .settings-panel p .switch.on {
+  background: var(--dsw-alias-state-business-primary);
+  border-color: transparent;
+}
+
+html[data-dsh-theme='dark'] .canvas-page .settings-panel p .switch:after {
+  background: var(--dsw-alias-switch-thumb);
+}
+
+/* ④ 破坏性按钮：两个主题都要修（不是深浅问题，是它本身就看不见）。
+   12% 灰底 + `#c8c8c8` 字 = 1.24，换成官方错误语义色。 */
+html[data-dsh-theme] .canvas-page .settings-panel p .danger {
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary) 36%, transparent);
+  color: var(--dsw-alias-state-error-primary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme] .canvas-page .settings-panel p .danger:hover {
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 20%, transparent);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent);
+}
+
+/* ── 面板 header 里的关闭按钮（`×`）──
+   实测（`ask-doodle-buttons.mjs` 的父链输出抓到）：`section.floating-panel > button`
+   就是它，不是工具条上的任何按钮。上游 `background: none` + `#8b919e` ——
+   **两个主题下都偏暗**：深色下 0.23 亮度的灰字压在深面板上，
+   浅色下虽然能看清但比 DSH 的次级文字重（它其实该是「可点但不强调」）。
+   统一成 label-secondary + 官方 ghost 悬停态。 */
+html[data-dsh-theme] .canvas-page :is(.floating-panel, .generate-panel) :is(header) button,
+html[data-dsh-theme] .canvas-page :is(.panel-close) {
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme] .canvas-page :is(.floating-panel, .generate-panel) :is(header) button:hover,
+html[data-dsh-theme] .canvas-page :is(.panel-close):hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 破坏性操作的配色**已在上面用 `[data-dsh-theme]` 通配写了一次**（两主题共用）。
+   这里原来还有一份 light 专属版（10%/32%），与通配版的 12%/36% 参数不同 ——
+   同一条规则在两个选择器里给不同值，是最难查的一类不一致，直接删掉。 */
+
+html[data-dsh-theme='light'] .canvas-page .save-state {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .save-state:first-letter {
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* ── 面板内的输入框 / 搜索框（合并上一节那两条） ──
+   上游 canvas-chrome.css 有 7 处 `color: #fff`，浅色下全是白底白字。 */
+html[data-dsh-theme='light'] .canvas-page :is(.floating-panel, .generate-panel) :is(input, textarea, select) {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-xs);
+  color-scheme: light;
+}
+
+html[data-dsh-theme='light'] .canvas-page :is(.floating-panel, .generate-panel) :is(input, textarea, select)::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ── 面板内的普通按钮 / 加节点项 ──
+   `.palette-item` 是「添加节点」面板里的条目（10 种节点），
+   上游 `#23262e` + `#333844` 描边 + `#e3e6ee` 文字。 */
+html[data-dsh-theme='light'] .canvas-page .palette-item {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-primary);
+  border-radius: var(--canvas-radius-xs);
+}
+
+html[data-dsh-theme='light'] .canvas-page .palette-item:hover {
+  background: var(--dsw-alias-bg-layer-2);
+  border-color: var(--dsw-alias-border-l2);
+}
+
+html[data-dsh-theme='light'] .canvas-page .palette-group-label {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 面板里的 hr / tabs 分隔线 */
+html[data-dsh-theme='light'] .canvas-page :is(.floating-panel, .generate-panel) :is(hr, .panel-tabs) {
+  border-color: var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* ── 空态引导 ──
+   上游 `rgba(20,20,20,0.97)` 深底 + 白字。浅色下白底浅描边。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-empty-guide {
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-md);
+  box-shadow: 0 1px 2px rgba(15, 17, 21, 0.05), 0 6px 16px rgba(15, 17, 21, 0.06);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-empty-guide :is(p, span, small) {
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* 空态的标题与说明文字：上游写死了浅色文字（`rgba(240,243,241,.9)` / `.4`），
+   浅色底下会变成**白底白字** —— 对比度只有 1.1，看不见。
+   这类「深底假设」的硬编码是浅色化最典型的漏网之处，
+   所以这里逐个点名，不靠 :is() 泛化（泛化会漏掉独立的 .canvas-empty-title）。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-empty-guide .canvas-empty-title {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-empty-guide small {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 空态那三个按钮：上游 `color: rgba(240,240,241,.85)` + `background: rgba(255,255,255,.05)`，
+   浅色下是"白底 + 几乎白的字"。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-empty-guide .canvas-empty-actions button {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-sm);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-empty-guide .canvas-empty-actions button:hover {
+  background: var(--dsw-alias-bg-layer-3);
+  border-color: var(--dsw-alias-border-l2);
+}
+
+/* ── 顶栏 ──
+   上游 `#e7e8eb` 文字 + 透明底。浅色下用主文字色。 */
+html[data-dsh-theme='light'] .canvas-page .ref-topbar {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .ref-title {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   画布菜单：顶栏的画布切换卡 + 右键上下文菜单（用户 2026-10-02 三次反馈补）
+   ───────────────────────────────────────────────────────────────────────────
+   这两个浮层之前**完全没被覆盖过** —— 不是「规则没赢」，是覆盖层里
+   一次都没出现过这两个选择器。它们和 `.floating-panel` 是不同的东西：
+   `v-if` 的开合式菜单，不在之前那 7 个面板的清单里。
+
+   症状：浅色 DSH 窗口里，顶栏「我的画布」点开后弹出的卡片是
+   `#22242b` 深底白字（截图实测 `rgb(34,36,43)`），在纯白画布上是一块黑斑。
+
+   上游两处用的是**同一套**配色（`canvas-chrome.css` 745 与 1246 行，
+   注释里自己写了「与 `.canvas-menu-card` 同一套」），
+   所以这里用一个合并选择器一次覆盖两处。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 卡片本体：`#22242b` 平涂 + `#383b45` 发丝边 + 12px 圆角 + `0 16px 44px #000a`。
+   阴影是 67% 黑的大模糊，和 P2.6 收掉的那批是同一个毛病，收成同一套。
+
+   ⚠️ **两主题都要写**，不能只写 light ——
+   上游那套 `#22242b` 在深色下不算违和，但阴影 67% 是按「纯黑底」设计的，
+   落在 `#151517` 的画布上糊成一团（实测 `rgba(0,0,0,0.667) 0 16px 44px`）。
+   只覆盖浅色的话，深色下这块反而成了唯一没收拾的浮层。 */
+html[data-dsh-theme] .canvas-page :is(.canvas-menu-card, .canvas-context-menu) {
+  box-shadow: var(--canvas-shadow-float);
+  /* 底色 / 描边 / 圆角两主题都换成 token ——
+     上游 `#22242b` + `#383b45` 是写死的，深色下它不对应 DSH 的任何一层
+     （`bg-layer-1` 深色是 `#232324`），菜单会比周围浮层略"偏黄褐"一点。 */
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-md);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 分隔线（卡头下边 / 动作区上边）：`#2e313a` 是深底上的发丝边，
+   浅色下要用官方 border-l1，否则深灰线在白底上又重又脏。 */
+html[data-dsh-theme='light'] .canvas-page :is(.canvas-menu-current, .canvas-menu-actions) {
+  border-color: var(--dsw-alias-border-l1);
+}
+
+/* 三级文字层级。上游是 `#6f7581`（eyebrow）/ `#fff`（画布名）/ `#777c87`（统计），
+   浅色下换成官方三级文字色 —— 层级关系不变，只是换了套色阶。 */
+html[data-dsh-theme='light'] .canvas-page :is(.canvas-menu-eyebrow, .canvas-menu-label) {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-menu-current strong {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page :is(
+  .canvas-menu-current small,
+  .canvas-menu-item small,
+  .canvas-menu-empty
+) {
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* 列表项 / 动作按钮：上游 `#d5d8de` 文字 + 透明底。
+   hover 底色 `#2c2f38` 是**为深底设计的实心色** ——
+   浅色下必须换，否则「浅底上的深色 hover 块」比不 hover 还难看。
+   和 P2.8 的工具条同理：透明底上要叠一层，就用半透明的 interactive-bg-hover。 */
+html[data-dsh-theme='light'] .canvas-page :is(.canvas-menu-item, .canvas-menu-actions button) {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page :is(.canvas-menu-item, .canvas-menu-actions button):hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 动作按钮里的图标：上游 `#8e95a1` 写死，hover 变白。
+   同样要点名 —— svg 有自己的 fill/stroke 声明，不从父按钮继承颜色。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-menu-actions button svg {
+  color: var(--dsw-alias-label-secondary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-menu-actions button:hover svg {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 菜单触发按钮（顶栏那个「我的画布 ∨」）。
+   常态透明（上游 `background: transparent`），但**展开态**上游写死了
+   `#252830`：
+
+     .canvas-page .canvas-project-menu .ref-title[aria-expanded='true'] {
+       color: #fff; background: #252830;      ← 特异 (0,4,0)
+     }
+
+   截图里用户看到的那块深色小方块就是它 —— 不是 hover。
+   它的特异性 (0,4,0) 比「祖先字体规则」的 (0,1,1) 高，
+   所以光写 `.ref-title { color: … }` 是压不住的（实测压了两次都没生效，
+   `why-loses.mjs` 把 12 条命中规则按特异性排出来才看清）。
+
+   两种状态都要覆盖，缺一个就还会漏：
+     · 展开态 → 实底 layer-2（按钮浮起，明确表示「现在开着」）
+     · hover 态 → 半透明 interactive-bg-hover（容器透明，只能叠一层）
+   两条都写 `!important` 之外的常规做法是**把特异性提上去**：
+   这里直接带上 `[aria-expanded]` / `:hover` 本身，
+   特异变成 (0,5,0) / (0,5,1)，稳稳压过上游那条。 */
+html[data-dsh-theme] .canvas-page .ref-title[aria-expanded='true'] {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme] .canvas-page .ref-title:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 展开态下的 hover 不该再叠一层半透明（那会变成「更灰」而不是「更亮」）。
+   保持展开态的实底，只是把文字提亮一档。 */
+html[data-dsh-theme] .canvas-page .ref-title[aria-expanded='true']:hover {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* ── 小地图 ──
+   Vue Flow 的 minimap 有自己的底色变量。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-minimap,
+html[data-dsh-theme='light'] .canvas-page .vue-flow__minimap {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--canvas-radius-sm);
+}
+
+html[data-dsh-theme='light'] .canvas-page .vue-flow__minimap-mask {
+  fill: rgba(15, 17, 21, 0.06);
+}
+
+/* ── 画布内输入类控件（涂鸦颜色选择、生成面板输入等） ──
+   凡是上游写死 `color: #fff` 的输入，浅色下都要反过来。
+   这里用选择器列表覆盖已定位到的几处，其余留给第二层逐屏补。 */
+html[data-dsh-theme='light'] .canvas-page :is(input, textarea, select) {
+  color-scheme: light;
+}
+
+html[data-dsh-theme='light'] .canvas-page .doodle-panel i.selected,
+html[data-dsh-theme='light'] .canvas-page .canvas-text-color.active {
+  /* 上游用白色描边表示"选中"，浅色下白描边等于看不见 → 换成品牌蓝。 */
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 1px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   P3 节点卡浅色化（用户 2026-10-02 四次反馈：「创作板还是有问题」）
+   ───────────────────────────────────────────────────────────────────────────
+   scan-all-nodes.mjs（种 localStorage 落全部 13 种节点）实测：**11 张卡全部
+   深底**，分两族 ——
+     · 通用卡底 `#262626`（canvas-editorial.css 51 行，10 种卡共用）
+     · 创作板 `#1f1f1f`（canvas-flow.css 860 行，is-board 自己的）
+   而且是最糟的状态：上一轮把 `.canvas-page` 的 color 改成了深色，
+   卡内**有自己 color 声明**的元素（标题 #ececec）还是浅色，但**没有**
+   自有声明的地方已经是深色 —— 半深半浅，黑的更黑。
+
+   为什么之前三轮都没碰它：节点卡是 `v-if` + **localStorage 驱动**的，
+   空画布上一张都不在 DOM 里。浮层面板扫描（scan-panels）扫不到它们，
+   全页扫描（scan-whole-page）在空画布上也扫不到。这次用
+   `scan-all-nodes.mjs` 直接种数据才让它们现形。
+
+   ⚠️ 全部只写 light 作用域：上游深色在深色画布（#151517）上是协调的，
+   只有浅色画布上才是一块块黑斑。深色档一根手指都不动。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 1. 卡片基（上游 canvas-editorial.css §1「深灰面板 + 白 18% 描边」）──
+   白 18% 描边压在白画布上等于没有；0.34 / 0.46 的大黑阴影同理收成 float。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card:hover {
+  border-color: var(--dsw-alias-border-l2);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+/* 选中 / 生成中：上游用近白描边（#f1f1f1 / rgba(241,241,241,.55)）表达，
+   浅色下白描边在白底上等于看不见 → 用品牌蓝，DSH 的选中语言就是它。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card.is-selected {
+  border-color: var(--dsw-alias-state-business-primary);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--dsw-alias-state-business-primary) 28%, transparent),
+    var(--canvas-shadow-float);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card.is-pending {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary) 55%, transparent);
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary) 18%, transparent),
+    var(--canvas-shadow-float);
+}
+
+/* 拖拽 / 按下：上游 0.42 / 0.46 的大黑影，浅色下收成 float 同值。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card:active,
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .vue-flow__node.dragging .canvas-card {
+  box-shadow: var(--canvas-shadow-float);
+}
+
+/* 卡内：缩略图底 / 标题 / 副标题 / 占位字母徽标。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card .card-thumb {
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card .card-label strong {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card .card-label small {
+  color: var(--dsw-alias-label-secondary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-card .card-thumb em {
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* ── 2. 节点浮动工具条（选中节点后浮在节点上方，上游 #1e1e1e 胶囊）──
+   扫描器抓不到它（选中态才渲染），但它和创作板是同一批黑斑。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar .card-tool {
+  color: var(--dsw-alias-label-secondary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar .card-tool:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar .card-tool.is-on {
+  background: var(--dsw-alias-interactive-bg-active);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 删除：上游注释说「灰阶加重不是红色」，但那是深底上的语言 ——
+   浅底上灰阶加重（白底更白）毫无表达。P2.7 已把设置面板的 danger
+   换成官方 error 红，这里对齐，破坏性操作在两个主题里说同一种话。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar .card-tool.is-danger:hover {
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent);
+  color: var(--dsw-alias-state-error-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar .card-tool-sep {
+  background: var(--dsw-alias-border-l2);
+}
+
+/* ── 3. 创作板全套（上游 canvas-flow.css 855–1260 行，20+ 处硬编码）── */
+
+/* 板本体：#1f1f1f / #343434 / 0.31 阴影 */
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-head strong {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 图标瓦片：装饰性指针图标 */
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-icon {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* 参考素材条：缩略占位 / 缺源虚框 / 删除角标 */
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-ref {
+  background: var(--dsw-alias-bg-layer-2);
+  border-color: var(--dsw-alias-border-l1);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-ref em {
+  color: var(--dsw-alias-label-secondary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-ref.is-missing {
+  border-color: var(--dsw-alias-border-l2);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-ref.is-missing em {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-ref-remove {
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 提示词区：#ececec 字 / #565656 占位 */
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-prompt {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-prompt::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 底部条：分隔线 / 模型胶囊（layer-2）/ 动作区（layer-3，保持两段分离）*/
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-foot {
+  border-top-color: var(--dsw-alias-border-l1);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model > svg:first-child,
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model > svg:last-child,
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model small,
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-cost svg {
+  color: var(--dsw-alias-label-secondary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model b {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-actions {
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-cost,
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-generate,
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-generate svg {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 生成键 hover：上游「变白」，浅色下变白等于没有 → 加一层半透明交互底 */
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-generate:hover:not(:disabled),
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-generate:hover:not(:disabled) svg {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 模型下拉 / @ 提及浮层：#262626 底 + 62% 黑大影 → layer-1 + float */
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board :is(.board-model-menu, .board-mention) {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model-tabs button {
+  color: var(--dsw-alias-label-secondary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model-tabs button.active {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model-option,
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-mention-item {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board :is(.board-model-option, .board-mention-item):hover,
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-mention-item.active {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model-option.selected,
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model-check {
+  color: var(--dsw-alias-state-business-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-model-dot {
+  background: var(--dsw-alias-bg-layer-2);
+  border-color: var(--dsw-alias-border-l1);
+}
+
+/* ── 4. 文本节点（编辑态输入框 + 属性工具条）──
+   输入框上游是「深色薄底垫在素材图上」——浅色下换成对称的浅薄底，
+   语义不变（透出画布、垫一层可读底）。工具条是浮层，收 layer-1。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-text .canvas-text-view {
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-text .canvas-text-input {
+  background: color-mix(in srgb, var(--dsw-alias-label-primary) 6%, transparent);
+  border-color: color-mix(in srgb, var(--dsw-alias-label-primary) 35%, transparent);
+  color: var(--dsw-alias-label-primary);
+  caret-color: var(--dsw-alias-state-business-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-text .canvas-text-input::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-text.is-selected :is(.canvas-text-view, .canvas-text-input) {
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--dsw-alias-state-business-primary) 40%, transparent);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-text-toolbar {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-text-btn {
+  color: var(--dsw-alias-label-secondary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-text-btn:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-text-btn.is-on {
+  background: var(--dsw-alias-interactive-bg-active);
+  color: var(--dsw-alias-label-primary);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-text-sep {
+  background: var(--dsw-alias-border-l2);
+}
+
+/* 字号输入框：本身 `background: transparent`，透出的是工具条那条已经变白的
+   底 —— #e6e8ee 的字打在上面看不见。它是「连带规则」的又一个例证：一个元素
+   自己没有底色，不等于它安全，要看它实际透出的是谁的底。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-text-size {
+  color: var(--dsw-alias-label-primary);
+}
+/* ── 5. 分组框：上游是「白 2.5% 底 + 白 15% 虚线」，浅色下完全隐形 →
+   对称地换成深色调的透明层。选中描边 #f5f5f5 同理换品牌蓝。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-group {
+  border-color: color-mix(in srgb, var(--dsw-alias-label-primary) 18%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-label-primary) 2%, transparent);
+}
+
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-group.is-selected {
+  border-color: var(--dsw-alias-state-business-primary);
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 5%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--dsw-alias-state-business-primary) 20%, transparent);
+}
+
+/* ═══ 6. 穷举补漏（P3 第二轮）══════════════════════════════════════════
+   前五节的做法是「用户截图打到哪，改到哪」。改完仍然不知道还剩多少 ——
+   于是写了 .workbuddy/verify/scan-dark-gap.mjs：把上游 4 份画布 CSS 全量
+   过一遍，只挑**底色类属性**里不透明且相对亮度低于 0.30 的字面量，再拿
+   选择器去本节比对，剩下的就是这一节要清的对象。
+
+   它比 bg 更重要的是一条连带规则：**每换一处底色，必须连带换掉它的文字色。**
+   容器一变白，原本写死的白字（`color: #fff`）就直接隐形了 —— 那只是把
+   「深色块」换成「白字看不见」，用户截图一样是坏的，而且更隐蔽：它不是
+   一块突兀的深色，是一片「什么都没有」。典型的两处：
+
+     .panel-search input { color: #fff }        ← 搜索框，打了字才看得见
+     .canvas-drop-hint strong { color: #f0f0f0 } ← 拖放提示，两条浅字直接从画布上消失
+
+   所以下面每一组都是「底 + 字」成对出现的。 */
+
+/* 6.1 面板搜索框 + 分类 tab（都在浮动面板里）。
+   涂鸦面板的色圆 `.doodle-panel i` 早在 P2 那节就覆盖了，这里不重复。 */
+html[data-dsh-theme='light'] .canvas-page .panel-search {
+  border-color: var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-secondary);
+}
+html[data-dsh-theme='light'] .canvas-page .panel-search input {
+  color: var(--dsw-alias-label-primary);
+}
+html[data-dsh-theme='light'] .canvas-page .panel-tabs b {
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 6.2 放置 / 框选的操作提示条：和 P2.9 的画布菜单同属一类浮层。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-place-hint,
+html[data-dsh-theme='light'] .canvas-page .canvas-marquee-hint {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+  color: var(--dsw-alias-label-secondary);
+}
+html[data-dsh-theme='light'] .canvas-page .canvas-place-hint strong,
+html[data-dsh-theme='light'] .canvas-page .canvas-marquee-hint strong {
+  color: var(--dsw-alias-label-primary);
+}
+html[data-dsh-theme='light'] .canvas-page .canvas-place-hint kbd,
+html[data-dsh-theme='light'] .canvas-page .canvas-marquee-hint kbd {
+  border-color: var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 6.3 右键菜单里的分隔线。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-context-sep {
+  background: var(--dsw-alias-border-l1);
+}
+
+/* 6.4 画布内的浮层提示与引导卡。上游统一是 rgba(20,20,20,.97) 的近黑片，
+   浅色下是糊在画布正中深深的一块。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-hint,
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-hint--info,
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-empty-guide {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+  color: var(--dsw-alias-label-secondary);
+}
+/* 拖放提示本身没有底，只有两条居中文字 —— 它是「连带规则」最典型的一例：
+   白底 + #f0f0f0 的字 = 什么都没有。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-drop-hint strong,
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-empty-guide strong {
+  color: var(--dsw-alias-label-primary);
+}
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-drop-hint small,
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .canvas-empty-guide small {
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* 6.5 卡片工具条上弹出的详情小面板。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar .card-info {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+  color: var(--dsw-alias-label-secondary);
+}
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar .card-info em {
+  color: var(--dsw-alias-label-tertiary);
+}
+html[data-dsh-theme='light'] .canvas-page .canvas-stage .card-toolbar .card-info b {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 6.6 创作板里 @提及 的图标块（22px 方角）。上游是 #333 底 + #3f3f3f 边。 */
+html[data-dsh-theme='light'] .canvas-page .canvas-card.is-board .board-mention-dot {
+  background: var(--dsw-alias-bg-layer-2);
+  border-color: var(--dsw-alias-border-l1);
+}
+
+/* 6.7 文本节点的下拉菜单（字体 / 字号 / 颜色）。和 P2.9 的画布菜单同一套语言。
+   这几个浮层不一定挂在 .canvas-page 下，所以这里不写 .canvas-page 前缀 ——
+   靠 html[data-dsh-theme] 已经足够压过上游的单类选择器。 */
+html[data-dsh-theme='light'] .canvas-text-menu {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+}
+html[data-dsh-theme='light'] .canvas-text-item {
+  color: var(--dsw-alias-label-primary);
+}
+html[data-dsh-theme='light'] .canvas-text-item:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+html[data-dsh-theme='light'] .canvas-text-item.active {
+  background: var(--dsw-alias-interactive-bg-active);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 6.8 区域节点的浮动调色板（.region-palette 同样不在 .canvas-page 下）。 */
+html[data-dsh-theme='light'] .region-palette {
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--canvas-shadow-float);
+}
+html[data-dsh-theme='light'] .region-palette-sep {
+  background: var(--dsw-alias-border-l2);
+}
+html[data-dsh-theme='light'] .region-palette-del {
+  color: var(--dsw-alias-label-secondary);
+}
+html[data-dsh-theme='light'] .region-palette-del:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-state-error-primary);
+}

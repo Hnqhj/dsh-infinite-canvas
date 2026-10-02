@@ -1,0 +1,36 @@
+# 依赖与构建产物（都可再生，别提交）
+build/node_modules/
+build/dist/
+build/public/
+build/fonts/
+# 上游源码镜像：每次 `npm run sync` 都会清空重建。改代码请改 build/overlay/ 或 build/tools/。
+build/src/
+
+# 上游只读参考（CNB 克隆）。默认上游路径指向这里，删掉它 `npm run sync` 就找不到源。
+_recon/
+
+# 验证工具的浏览器 profile：会写缓存，塞满盘会让整条工具链 ENOSPC。
+# ⚠️ 通配写法，不是单个目录 —— 每个探针脚本都会自己起一个独立 profile
+# （`.edge-allnodes-profile` / `.edge-menu-profile` / `.edge-bars-profile` …），
+# 只写死那一个名字的话，新加一个脚本就漏一个。这些目录里还有浏览器缓存和 cookie。
+.workbuddy/verify/.edge-*/
+
+# 验证脚本本身是要提交的 —— tools/smoke-test.mjs 的 B10 ⑭⑮ 依赖它们
+# （check-overlay-hygiene.mjs / scan-dark-gap.mjs），忽略掉会让 clone 后跑不了测试。
+# 但它们产出的截图是中间产物（正式截图在 docs/），不提交。
+.workbuddy/verify/*.png
+.workbuddy/verify/*.txt
+.workbuddy/verify/probe/
+
+# 本地工作笔记：含个人背景、本机路径、未公开的项目上下文。不进版本库。
+.workbuddy/memory/
+
+# 构建产物本身也不提交：它由 `npm run build` 生成，且 lib/embed/assets 里
+# 有 448 个 MiSans 分包（9.5MB）与 8 张演示图（5.9MB），体积大且可完全再生。
+lib/embed/assets/
+lib/embed/library-assets/
+lib/embed/index.html
+
+node_modules/
+*.log
+tmp-*.txt

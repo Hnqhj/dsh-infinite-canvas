@@ -1,0 +1,29 @@
+{
+  "name": "dsh-infinite-canvas-embed",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "把 Poiesis / NexusVault 的画布（apps/web/src/canvas）单独构建成 DSH 插件可静态托管的 iframe 页面。依赖清单刻意只保留画布闭包用到的包。",
+  "scripts": {
+    "sync": "node tools/sync-upstream.mjs && node tools/copy-static.mjs",
+    "build": "node tools/sync-upstream.mjs && node tools/copy-static.mjs && vite build && node tools/install-embed.mjs",
+    "build:only": "vite build && node tools/install-embed.mjs",
+    "sync:only": "node tools/sync-upstream.mjs",
+    "install-embed": "node tools/install-embed.mjs",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.45.0",
+    "@vue-flow/background": "^1.3.2",
+    "@vue-flow/controls": "^1.1.3",
+    "@vue-flow/core": "^1.48.2",
+    "@vue-flow/minimap": "^1.5.4",
+    "misans": "^5.0.0",
+    "vue": "^3.5.39",
+    "vue-router": "^5.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.7",
+    "vite": "^8.1.1"
+  }
+}
