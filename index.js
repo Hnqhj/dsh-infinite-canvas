@@ -57,25 +57,49 @@ export function apply(ctx, config) {
         bridge.dispose();
     }, 'infinite-canvas: activation state');
 
-    /** 自检状态：`/status` 会把它带出来。 */
-    const state = { web: false, tools: { registered: false, names: [], reason: 'not attempted' } };
+    /** 自检状态：`/status` 会把它带出来。 `error` 记录注册失败的原因（成功则为 null）。 */
+    const state = {
+        web: false,
+        webError: null,
+        webAttempts: 0,
+        tools: { registered: false, names: [], reason: 'not attempted' },
+    };
+    // 交引用而不是快照：注册是懒绑定的，这一步之后 `state` 还会变。
+    bridge.setHostState(state);
 
     // `autoOpenPanel` 是给浏览器半读的：命令到达时画布没开，要不要自动打开。
     // 放在桥上而不是各存一份，是为了让两边读到同一个值。
     bridge.autoOpenPanel = resolved.autoOpenPanel;
 
     // ---- HTTP 面：懒绑定，服务出现即注册
+    /**
+     * 最多重试几次。
+     *
+     * `webServer.register` 对重复路径会抛错，所以「注册成功」和「没抛错」在这里
+     * 是一回事：真失败之后重复尝试只会重复抛同一个错。次数到了就停在失败状态上，
+     * 原因写到 `/status` 的 `host.webError` —— 总比留在「也许是还没轮到它」强。
+     */
+    const MAX_WEB_ATTEMPTS = 3;
+
     const registerWebSurface = () => {
-        if (state.web || disposed) return;
+        if (state.web || disposed || state.webAttempts >= MAX_WEB_ATTEMPTS) return;
         const webServer = ctx.get(WEB_SERVER_KEYS[0]) ?? ctx.get(WEB_SERVER_KEYS[1]);
         if (webServer === undefined) return;
+        state.webAttempts += 1;
         // 栅栏是"每次请求解析"的函数：Connection 行可能后于本行激活，快照会留下
         // 一个永久空洞（等于把接口开放给任意网页）。
         const gate = () => ctx.get('connection');
-        // `ctx.effect` 立即执行工厂；对重复路径 webServer 会抛错，所以只有注册
-        // 真的成功后才能把标志位置真 —— 否则一次失败会变成永久激活失败。
-        ctx.effect(() => registerInfiniteCanvasRoutes(webServer, gate, bridge), 'infinite-canvas: HTTP API');
+        try {
+            // `ctx.effect` 立即执行工厂；失败要留痕 —— 静默失败会让「为什么没有
+            // HTTP 面」变成一次考古，而 `/status` 一句话就能回答。
+            ctx.effect(() => registerInfiniteCanvasRoutes(webServer, gate, bridge), 'infinite-canvas: HTTP API');
+        } catch (error) {
+            state.webError = `present="${webServer === undefined ? 'no' : 'yes'}": ${String(error)}`;
+            ctx.logger.warn(`infinite-canvas: HTTP API 注册失败（第 ${state.webAttempts} 次）：${String(error)}`);
+            return;
+        }
         state.web = true;
+        state.webError = null;
         ctx.logger.info('infinite-canvas: HTTP API mounted at /api/dsh-canvas');
     };
     registerWebSurface();
@@ -122,14 +146,7 @@ export function apply(ctx, config) {
         if (serviceName === 'tools') void registerTools();
     });
 
-    // 自检状态也从桥那儿一起带出去，`/api/dsh-canvas/status` 已经回桥的快照，
-    // 这里只补宿主半自己的注册情况，方便出问题时一眼看出是哪一半没挂上。
-    ctx.effect(() => {
-        const timer = setInterval(() => {
-            if (disposed) return;
-            if (state.web && state.tools.registered) clearInterval(timer);
-        }, 2_000);
-        timer.unref?.();
-        return () => clearInterval(timer);
-    }, 'infinite-canvas: readiness probe');
+    // 这里原先有一个每 2 秒一次的 「readiness probe」定时器，唯一的作用是在两半
+    // 都挂上之后把自己清掉 —— 自检状态从前也确实无处可去。现在它被 `/status`
+    // 的 `host` 字段取代了：那一栏实时反映这里的一切，不需要再有东西轮询就够了。
 }

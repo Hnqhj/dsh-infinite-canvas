@@ -76,8 +76,20 @@ window.__ModuleLoader__.load({
          * 不是占位页 —— 占位页在 P1 迁移时已经删掉了。
          */
         const EMBED_URL = `${API}/embed/index.html`;
-        /** 哨兵轮询间隔：只为"要不要自动开面板"服务，不需要快。 */
-        const SENTINEL_INTERVAL_MS = 2_500;
+        /**
+         * 退避间隔：**只在挂起式等待不成立时**才用它（宿主半还是老版本、请求失败、
+         * 或画布已经开着没必要挂请求）。
+         *
+         * 挂起式生效时这里几乎用不上：请求打到服务端就被留在那儿，直到真有命令，
+         * 命令一到立刻回来 —— 那是用的 Server 那边的等待，不是这边的定时器。
+         */
+        const SENTINEL_BACKOFF_MS = 2_500;
+        /**
+         * 一次挂起往返如果快过这个数，说明服务端**没有**真的挂住我们（老版本宿主半
+         * 会把 `hold` 当没看见，直接回快照）。那种情况下必须用上面的退避，否则
+         * 「立刻返回 → 立刻再问」会打成每秒几十次的热循环。
+         */
+        const MIN_HOLD_MS = 250;
         /** 自动开过一次之后的冷却，避免命令连发时反复抢焦点。 */
         const AUTO_OPEN_COOLDOWN_MS = 6_000;
         /** 超过这个时间还没收到画布的 ready，就认为出问题并给出诊断。 */
@@ -98,6 +110,11 @@ window.__ModuleLoader__.load({
             'frame.title': '无限画布',
             'diagnostic.title': '画布脚本没有回应',
             'diagnostic.hint': '常见原因：接口被信任栅栏拦下（403）、画布静态包没打进去、或脚本抛错。iframe 文档里的文字在下面。',
+            'diagnostic.lost': '画布脚本失去了响应',
+            'diagnostic.lostHint': '命令通道还是通的，但画布已经把它的处理器注销了 —— 面板被重新挂载过，或者画布内部抛了错。',
+            'diagnostic.transport': '画布连不上命令通道',
+            'diagnostic.transportHint': '下面是通道自己报的最后一处故障。命令现在发不进去，面板里的手动操作不受影响。',
+            'diagnostic.health': '轮询 {polls} · 已应答 {answered} · 错误 {errors} · 在途 {inFlight}',
         };
         const en = {
             'tab.title': 'Canvas',
@@ -106,6 +123,11 @@ window.__ModuleLoader__.load({
             'frame.title': 'Infinite canvas',
             'diagnostic.title': 'The canvas script did not respond',
             'diagnostic.hint': 'Likely causes: the route is blocked by the trust gate (403), the embed bundle is missing, or the script threw. The raw iframe text is below.',
+            'diagnostic.lost': 'The canvas stopped responding',
+            'diagnostic.lostHint': 'The channel is still up, but the canvas has unregistered its handler — the panel remounted, or something threw inside it.',
+            'diagnostic.transport': 'The canvas cannot reach the command channel',
+            'diagnostic.transportHint': 'The last failure reported by the channel itself is below. Commands cannot get through; manual work inside the panel is unaffected.',
+            'diagnostic.health': 'polls {polls} · answered {answered} · errors {errors} · in flight {inFlight}',
         };
 
         /** 拿不到宿主 translator 时的兜底：按页面语言在 zh / en 之间二选一。 */
@@ -132,6 +154,13 @@ window.__ModuleLoader__.load({
             sessionId: null,
             /** 最近一次 `/status` 快照（诊断用）。 */
             lastStatus: null,
+            /**
+             * 我们已经见过的命令计数 —— 挂起式等待的游标。
+             *
+             * 没有它，服务端就不知道"这条命令你处理过了"，只要队列里还有东西就
+             * 立刻回答，两边会互相追着打成热循环。语义和长轮询的 cursor 一样。
+             */
+            since: 0,
         };
 
         /* ── 主题跟随 ─────────────────────────────────────────────────────── */
@@ -361,6 +390,69 @@ window.__ModuleLoader__.load({
                 }));
         }
 
+        /**
+         * 从传输层的状态快照里挑出**界面真的会用到**的那几项。
+         *
+         * 挑出来而不是整体存：`pollOnce()` 每趟结束都 `emit` 一次，空载时约每 180
+         * 毫秒一条消息；整体存进 state 的话，这块面板会跟着每 0.18 秒重渲染一次 ——
+         * 而它关心的其实只是「画布还在不在」和「有没有出错」。
+         *
+         * 关键项没变时**返回原对象**：`setState` 拿到同一个引用就会跳过重渲染。
+         *
+         * @param payload - 传输层 `status()` 的快照。
+         * @param previous - 上一次的健康摘要（首次为 `null`）。
+         */
+        function reduceHealth(payload, previous) {
+            if (payload === null || typeof payload !== 'object') return previous;
+            const next = {
+                canvasReady: payload.canvasReady === true,
+                lastError: typeof payload.lastError === 'string' && payload.lastError !== ''
+                    ? payload.lastError
+                    : null,
+                errors: Number(payload.errors) > 0 ? Number(payload.errors) : 0,
+                inFlight: Array.isArray(payload.inFlight) ? payload.inFlight.length : 0,
+                // 计数类只在有人看的时候才需要精确 —— 顺手带上，不参与比较。
+                polls: Number(payload.polls) || 0,
+                answered: Number(payload.answered) || 0,
+            };
+            if (previous !== null
+                && previous.canvasReady === next.canvasReady
+                && previous.lastError === next.lastError
+                && previous.errors === next.errors
+                && previous.inFlight === next.inFlight) {
+                return previous;
+            }
+            return next;
+        }
+
+        /**
+         * 决定现在该显示哪一条诊断（没有则返回 `null`）。
+         *
+         * 三种情况，按"谁更能解释现状"排序：
+         *
+         *   ① 曾经 ready 过、但传输层说画布的处理器没了 —— 面板重挂载或画布内部报错。
+         *      这是**最容易漏的一类**：它不像"白屏"那样一眼看出来，语义是"页面看着
+         *      还正常，但对话里的命令一条都进不来"。
+         *   ② 到点还没 ready —— 走原来的 iframe 原文诊断。
+         *   ③ 传输层自己报错了 —— 把通道原文的故障端出来。
+         */
+        function pickDiagnostic({ ready, health, failure, t }) {
+            // ① 画布曾经在，但处理器没了。**不给 iframe 原文**：那时候画面往往还是
+            //    好好的，`describeFrame` 抓下来的只会是一堆画布自己的 UI 文案 ——
+            //    那不是证据，是噪音。
+            if (ready && health !== null && health.canvasReady === false) {
+                return { title: t('diagnostic.lost'), hint: t('diagnostic.lostHint'), detail: null, health };
+            }
+            // ② 从来没 ready 过才有意义；ready 之后 `failure` 会被清掉。
+            if (!ready && failure !== null) {
+                return { title: t('diagnostic.title'), hint: t('diagnostic.hint'), detail: failure, health };
+            }
+            if (health !== null && health.lastError !== null) {
+                return { title: t('diagnostic.transport'), hint: t('diagnostic.transportHint'), detail: health.lastError, health };
+            }
+            return null;
+        }
+
         /* ── tab 正文 ─────────────────────────────────────────────────────── */
 
         /**
@@ -371,8 +463,19 @@ window.__ModuleLoader__.load({
          */
         function Body(props) {
             const frameRef = useRef(null);
-            const readyRef = useRef(false);
-            const [diagnostic, setDiagnostic] = useState(null);
+            const [ready, setReady] = useState(false);
+            /**
+             * 传输层自己上报的健康状况：`canvasReady` / `lastError` / `errors` / `inFlight`。
+             *
+             * 它每完成一趟轮询就 `emit` 一次（空载时大约每 180 毫秒一条消息），所以
+             * **只挑真正会在界面上出现的那几项存**，且变了才更新 —— 见 `reduceHealth`。
+             */
+            const [health, setHealth] = useState(null);
+            /**
+             * 帧诊断：到点还没 ready 时去看一眼 iframe，把里面的原文抓下来。
+             * 与 `health` 分开，是因为它是一次性的快照，而后者是持续订阅。
+             */
+            const [failure, setFailure] = useState(null);
             const t = typeof props?.t === 'function' ? props.t : fallbackT();
 
             /**
@@ -414,16 +517,25 @@ window.__ModuleLoader__.load({
                 };
             }, [sessionId]);
 
-            // 画布上报就绪与状态。
+            // 画布上报就绪与运行状态。
             useEffect(() => {
                 const onMessage = (event) => {
+                    // 只认同源消息：iframes 之外的另一个窗口也能往这里 postMessage，
+                    // 伪造一条 `ready` 就能让诊断条无声消失。
+                    if (event.origin !== window.location.origin) return;
                     const data = event.data;
                     if (data === null || typeof data !== 'object') return;
                     if (data.source !== MESSAGE_SOURCE) return;
                     if (data.type === 'ready') {
-                        readyRef.current = true;
-                        setDiagnostic(null);
+                        setReady(true);
+                        // 超时那次抓下的帧原文已经过期 —— 留着它，画布恢复之后
+                        // 还会挂着一条早就对不上现状的诊断。
+                        setFailure(null);
+                        return;
                     }
+                    // 函数式更新：effect 因此不必依赖 `health`，监听器也就不会
+                    // 随着每一条 status 消息反复卸载重装。
+                    if (data.type === 'status') setHealth((prev) => reduceHealth(data.payload, prev));
                 };
                 window.addEventListener('message', onMessage);
                 return () => window.removeEventListener('message', onMessage);
@@ -441,12 +553,19 @@ window.__ModuleLoader__.load({
             // 到点还没 ready 就去看一眼 iframe 里到底是白屏、错误页还是别的什么。
             // 这是 P0 阶段最值钱的一段代码：它把"没反应"变成"能读到原因"。
             useEffect(() => {
+                if (ready) return undefined;
                 const timer = setTimeout(() => {
-                    if (readyRef.current) return;
-                    setDiagnostic(describeFrame(frameRef.current));
+                    setFailure(describeFrame(frameRef.current));
                 }, READY_TIMEOUT_MS);
                 return () => clearTimeout(timer);
-            }, []);
+            }, [ready]);
+
+            // 该显示哪一条诊断（没有则 `null`）。用 `useMemo` 是因为「要不要显示」
+            // 由四个状态共同决定，而它们的变化频率差得很远。
+            const diagnostic = useMemo(
+                () => pickDiagnostic({ ready, health, failure, t }),
+                [ready, health, failure, t],
+            );
 
             return h('div', { style: { position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' } },
                 h('iframe', {
@@ -481,7 +600,7 @@ window.__ModuleLoader__.load({
                                 background: 'var(--dsw-alias-state-danger, #f25a5a)',
                             },
                         }),
-                        h('span', { style: { fontWeight: 500 } }, t('diagnostic.title'))),
+                        h('span', { style: { fontWeight: 500 } }, diagnostic.title)),
                     h('div', {
                         // 次级文字用 label-secondary 而不是 opacity —— 前者跟着主题走，
                         // 后者在浅色下会变得偏淡。
@@ -489,8 +608,17 @@ window.__ModuleLoader__.load({
                             color: 'var(--dsw-alias-label-secondary, #cfd3d6)',
                             marginTop: 3, fontSize: 12,
                         },
-                    }, t('diagnostic.hint')),
-                    h('pre', {
+                    }, diagnostic.hint),
+                    diagnostic.health === null ? null : h('div', {
+                        // 传输层自己的计数。它平时是隐形的，只有出错时才值得占一行 ——
+                        // 「轮询多少次、应答了多少」恰恰是判断"管子到底断在哪"的依据。
+                        style: {
+                            color: 'var(--dsw-alias-label-secondary, #cfd3d6)',
+                            marginTop: 3, fontSize: 12,
+                            fontFamily: 'var(--dsw-font-family-mono, ui-monospace, monospace)',
+                        },
+                    }, healthSummary(t, diagnostic.health)),
+                    diagnostic.detail === null ? null : h('pre', {
                         style: {
                             margin: '8px 0 0', padding: '8px 10px', maxHeight: 140, overflow: 'auto',
                             fontSize: 11, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
@@ -501,7 +629,16 @@ window.__ModuleLoader__.load({
                             // 官方圆角尺度：xs 4 / sm 8 / md 12 / lg 16 / panel 28
                             borderRadius: 'var(--dsw-radius-xs, 4px)',
                         },
-                    }, diagnostic)));
+                    }, diagnostic.detail)));
+        }
+
+        /** 把传输层的计数排成一行可读文字。词典里的 `{polls}` 这类占位在此落地。 */
+        function healthSummary(t, health) {
+            return t('diagnostic.health')
+                .replace('{polls}', String(health.polls))
+                .replace('{answered}', String(health.answered))
+                .replace('{errors}', String(health.errors))
+                .replace('{inFlight}', String(health.inFlight));
         }
 
         /**
@@ -585,22 +722,67 @@ window.__ModuleLoader__.load({
 
             // ④ 哨兵。`/status` 是纯读端点，问多少次都不会把命令消费掉，
             //    所以"看一眼"和"取走"是两件事，不存在竞态。
+            //
+            //    **挂起式而不是定时轮询。** 命令没来的话，请求一直挂在服务端；
+            //    命令一到服务端立刻回答，我们立刻去开面板。原来的做法是从固定的
+            //    2.5 秒间隔里碰运气 —— 平均白等 1.25 秒，而整个冷路径总共才 12 秒，
+            //    这一块是最贵也最没必要的开支。请求量还从每分钟 24 次降到 3 次。
             ctx.effect(() => {
+                let stopped = false;
+                let timer = null;
+                /** 下一次出发的时刻。一次只挂一个请求，由服务端替我们等待。 */
+                const schedule = (delayMs) => {
+                    if (stopped) return;
+                    timer = setTimeout(() => { void tick(); }, Math.max(0, delayMs));
+                };
+
                 const tick = async () => {
-                    if (runtime.mounted > 0) return;          // 画布开着，iframe 自己在轮询
-                    if (Date.now() < runtime.cooldownUntil) return;
+                    if (stopped || runtime.mounted > 0) {
+                        // 画布开着，iframe 自己在长轮询；隔一会儿再看，不必挂请求。
+                        if (!stopped) schedule(SENTINEL_BACKOFF_MS);
+                        return;
+                    }
+                    if (Date.now() < runtime.cooldownUntil) {
+                        schedule(runtime.cooldownUntil - Date.now());
+                        return;
+                    }
                     let payload;
+                    const started = Date.now();
                     try {
-                        const response = await fetch(`${API}/status`, { cache: 'no-store' });
-                        if (!response.ok) return;
+                        const response = await fetch(
+                            `${API}/status?hold=1&since=${runtime.since}`,
+                            { cache: 'no-store' },
+                        );
+                        if (!response.ok) {
+                            // 宿主半还没挂上（或已被卸载），下次再说。
+                            schedule(SENTINEL_BACKOFF_MS);
+                            return;
+                        }
                         payload = await response.json();
                     } catch {
-                        return;                                // 宿主半还没挂上，下次再说
+                        schedule(SENTINEL_BACKOFF_MS);
+                        return;
                     }
+                    if (stopped) return;
+
                     runtime.lastStatus = payload;
+                    const seq = Number(payload?.seq);
+                    if (Number.isFinite(seq) && seq > runtime.since) runtime.since = seq;
+
                     const queued = Array.isArray(payload?.queued) ? payload.queued : [];
-                    if (!takeFresh(queued)) return;
-                    if (payload?.autoOpenPanel !== true) return;
+                    const fresh = takeFresh(queued);
+                    const cost = Date.now() - started;
+
+                    if (!fresh && cost < MIN_HOLD_MS) {
+                        // 服务端没真的挂住我们 —— 多半是宿主半还是旧版本（`hold`
+                        // 参数被当成没看见）。退回定时轮询的节奏，别打成热循环。
+                        schedule(SENTINEL_BACKOFF_MS);
+                        return;
+                    }
+                    if (!fresh || payload?.autoOpenPanel !== true) {
+                        schedule(0);
+                        return;
+                    }
                     runtime.cooldownUntil = Date.now() + AUTO_OPEN_COOLDOWN_MS;
                     try {
                         ctx.sidebarRight.openTab(TAB_KIND, {});
@@ -609,9 +791,15 @@ window.__ModuleLoader__.load({
                         // 超时文案去解释，不能让它把插件弄崩。
                         console.warn(`[dsh-canvas] 自动打开画布失败：${String(error)}`);
                     }
+                    schedule(AUTO_OPEN_COOLDOWN_MS);
                 };
-                const timer = setInterval(() => { void tick(); }, SENTINEL_INTERVAL_MS);
-                return () => clearInterval(timer);
+
+                // 初次不必抢：真有命令时服务端会立刻回答，早出发的价值只在于早建立连接。
+                schedule(0);
+                return () => {
+                    stopped = true;
+                    if (timer !== null) clearTimeout(timer);
+                };
             }, 'infinite-canvas: auto-open sentinel');
         }
 

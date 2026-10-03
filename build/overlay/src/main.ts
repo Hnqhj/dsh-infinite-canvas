@@ -95,6 +95,8 @@ import './dsh-shell.css'
 
 import router from './router'
 import { installDshBridge } from './dsh-bridge'
+import { installExtendedCommands } from './dsh-commands'
+import { useVueFlow } from '@vue-flow/core'
 
 /**
  * 根组件：只有一个路由出口。
@@ -102,10 +104,24 @@ import { installDshBridge } from './dsh-bridge'
  * 不写成 `.vue` 文件，是因为它确实只有一行 —— 多一个 SFC 就多一个需要跟上游
  * 无关的构建产物。上游用 `App.vue` + `AppLayout.vue` 是因为它需要整套应用外壳，
  * 我们的「外壳」就是 `dsh-shell.css` 那几行高度声明。
+ *
+ * ## 为什么它现在有 `setup()` 而不只是 `render()`
+ *
+ * 扩展命令要改卡片，就得够得着画布的状态，而 `useVueFlow()` **在组件外调用会新建
+ * 一个空 store**（拿不到画布那个）。放在这里调用就对了：根组件 `provide` 的 store
+ * 会被路由子组件 `CanvasView` 的 `useVueFlow()` `inject` 到 —— 我们手里这份**就是
+ * 画布正在用的那一份**。
+ *
+ * 顺序也是关键的：根组件的 `setup` 早于任何路由组件，所以 `installExtendedCommands`
+ * 一定抢在画布注册处理器之前把接口包好。
  */
 const Root = {
   name: 'CanvasEmbedRoot',
-  render: () => h(RouterView),
+  setup() {
+    const flow = useVueFlow()
+    installExtendedCommands(flow)
+    return () => h(RouterView)
+  },
 }
 
 installDshBridge()

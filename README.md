@@ -41,7 +41,7 @@ DSH 的对话里多出 9 个 `canvas_*` 工具。你用人话下指令，模型�
 
 | 部分 | 状态 |
 |---|---|
-| 宿主半：HTTP 面 + 命令桥 + 9 个 Agent 工具 | ✅ 完成，**38 项冒烟测试全绿** |
+| 宿主半：HTTP 面 + 命令桥 + 10 个 Agent 工具 | ✅ 完成，**53 项冒烟测试全绿** |
 | 浏览器半：tab 注册、iframe 承载、主题跟随、自动开面板 | ✅ 完成 |
 | 画布本体 | ✅ **真画布**：节点卡、8 个面板、右键菜单、涂鸦层、色块、小地图、项目管理页全部可用 |
 | 命令闭环 | ✅ 实测：`add_card` / `select_card` / `open_panel` / `get_canvas` 返回的都是真画布自己的结构 |
@@ -60,8 +60,15 @@ DSH 的对话里多出 9 个 `canvas_*` 工具。你用人话下指令，模型�
 > - 打开生成面板
 
 **命令到达时画布没开？** 会自动把右栏画布 tab 打开（`autoOpenPanel: true`，默认开）。
-这条靠一个哨兵实现：画布没开时每 2.5 秒读一次 `/status`（纯读端点，不会把命令消费掉），
-发现队列里有新命令就去开面板。
+
+这条靠一个哨兵实现：画布没开时它向 `/status` 发一个**挂起式**请求 —— 没有命令就一直挂在
+服务端，命令一产生立刻返回，哨兵随即去开面板。请求次数反而更少（每分钟 3 次，而不是原来定时
+轮询的 24 次），更重要的是**命令到达的延迟从「平均白等 1.25 秒」降到一次往返** —— 那 1.25 秒
+是冷路径里最贵也最没必要的一块（详见下面的「冷路径」一节）。`/status` 是纯读端点，不会把命令
+消费掉，所以"看一眼"和"取走"仍然是两件事。
+
+服务端为什么知道"这条命令你处理过了"：哨兵每次带 `since=<已知的 seq>`，只有出现更新的命令时
+服务端才回答。少了这个游标，"立刻回答 + 立刻再问"会打成热循环。
 
 ## 安装
 
@@ -103,8 +110,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/dev-install.ps1 `
 
 **第一次打开看三件事：**
 
-1. 右栏引导页上有没有「画布」入口 —— 没有就是浏览器半没挂上（看 DSH 日志里有无 `infinite-canvas`）
-2. 点开后 iframe 里有没有画布 —— 若出现「画布脚本没有回应」的诊断条，它会把 iframe 文档原文摊开给你看，最常见是 403（信任栅栏拦下了 iframe 导航）
+1. 右栏引导页上有没有「画布」入口 —— 没有的话先问 `/status` 的 `host` 字段：`host.web` / `host.tools.registered` 会直接说出是**哪一半**没挂上（`host.webError` 是注册失败的原因）。两半互相看不见，看错方向就白查；DSH 日志里搜 `infinite-canvas` 是同一个答案的另一处来源。
+2. 点开后 iframe 里有没有画布 —— 出问题时诊断条会自己出来，它有三种：「画布脚本没有回应」摊开 iframe 原文（最常见是 403：信任栅栏拦下了 iframe 导航）、「画布脚本失去了响应」说明线路通但画布把处理器注销了、「画布连不上命令通道」最后一次故障原文就在下面。每种都附一行传输层自己的计数。
 3. 颜色跟不跟 DSH —— 主题初值走 URL 参数 `?theme=`，之后靠 postMessage 跟随
 
 **手工排查（不经过模型）：**
@@ -122,22 +129,40 @@ curl -s http://127.0.0.1:8791/api/dsh-canvas/status   # 桥与浏览器的诊断
 
 在 DSH 里对应 `http://127.0.0.1:19387/api/dsh-canvas/status`。
 
+`/status` 还能**挂起**：带上 `?hold=1&since=<已知的 seq>` 之后，没有新命令它就一直不回答。
+浏览器半的哨兵正是这样等命令的。不带 `hold` 就是一次普通的快照读取。
+
 ## 命令面
 
-9 个 Agent 工具，全部带 `canvas_` 前缀。`kind` 是给模型的 **7 值公开枚举**，
-`type` 是节点类型真源 —— **读以 `type` 为准，写只能用 `kind`**。
+12 个 Agent 工具，全部带 `canvas_` 前缀。`kind` 是给模型的 **7 值公开枚举**，
+`type` 是节点类型真源 —— **读以 `type` 为准**；建卡只能用 `kind`，**换类型用 `type`**。
 
 | 工具 | 画布动作 | 说明 |
 |---|---|---|
 | `canvas_ping` | `ping` | 连通性探针，由传输层自己回答（画布契约里没有这条） |
 | `canvas_get` | `get_canvas` | 读全部卡片、涂鸦、视口、选中、面板。**改之前先调它** |
-| `canvas_add_card` | `add_card` | 建卡，返回 id |
+| `canvas_add_card` | `add_card` | 建卡，返回 id。**坐标要么两个都给、要么都不给** —— 只给一个时真画布会把另一个轴置 0 |
+| `canvas_update_card` | `update_card` | **往卡片里写内容 / 改标题**（见下）。写入是合并，不是替换 |
+| `canvas_set_card_type` | `set_card_type` | **换节点类型**，用于 `kind` 枚举覆盖不到的类型 |
 | `canvas_move_card` | `move_card` | 移动到世界坐标 |
 | `canvas_delete_card` | `delete_card` | 删除（破坏性，先 `get` 确认） |
 | `canvas_select_card` | `select_card` | 选中，用户能看到选中框 |
 | `canvas_set_view` | `set_view` | 缩放 / 平移 / `fit` |
 | `canvas_open_panel` | `open_panel` | 打开 8 个面板之一 |
+| `canvas_batch` | _（多个）_ | 一次调用顺序执行多条命令，失败即停并报出做到了第几步。只在插件侧编排，不新增画布动作 |
 | `canvas_run_agent` | `run_agent` | 交给画布自己的助手（**目前是关键词占位**） |
+
+`update_card` / `set_card_type` / `set_card_data` 这三条是**内嵌页专有**的：上游契约里没有它们，
+上游桌面端的 MCP 服务也不认。真源在 `build/overlay/src/dsh-commands.ts`。
+
+写内容时 `data` 该给哪些键，取决于卡片类型：
+
+| 类型 | 字段 |
+|---|---|
+| `storyboard_shot`（分镜，`kind: 'board'`） | `shot_no` / `summary` / `dialogue` / `prompt` / `duration_sec` / `target` / `model_id` / `output_url` / `refs` |
+| `entity_character` / `entity_scene` / `entity_prop` | `name` / `description` / `ref_asset_ids` / `preview_url` |
+| `note` | `text` |
+| `gen_text` | `prompt` / `output` / `model_id` |
 
 `kind` → `type` 的投影：
 
@@ -146,6 +171,73 @@ scene → entity_scene      character → entity_character   note → note
 text  → gen_text          board     → storyboard_shot     video → gen_video
 audio → asset_input（并写入 data.media_type = 'audio'）
 ```
+
+### 冷路径：超时预算分成两档
+
+「画布已经在那儿等着」和「得先把面板唤醒、再把整个 iframe 拉起来」是两条差一个量级的链路。
+共用一份预算，等于让**第一次操作**必输 —— 而且失败之后画布还是被打开了，用户看到的是
+「模型说失败了，画布却莫名其妙弹出来了」。
+
+冷路径（画布从未连上过、且开着自动打开）真实要花的时间：
+
+| 环节 | 大约 | 出处 |
+|---|---|---|
+| 哨兵发现命令 | 一次往返 | client.js 的挂起式 `/status` |
+| iframe 冷启动 | 3~5 秒 | 首屏 style 986KB + CanvasView 292KB + Vue 挂载 |
+| 等画布注册处理器 | 最多 4 秒 | `canvas-transport.js` 的 `HANDLER_GRACE_MS` |
+| 执行 + 回执 | 约 0.3 秒 | 与热路径同 |
+
+所以它用的是另一份预算（默认 **20 秒**，见 `lib/config.js` 的 `coldCommandTimeoutMs`），
+热路径仍是 12 秒。判定发生在命令**入队的瞬间**：那一刻画布有没有连过，决定了它配等多久。
+开着面板（`autoOpenPanel`）才适用 —— 否则等下去没有意义。
+
+### 模型能改什么、改不了什么
+
+| 能 | 不能 |
+|---|---|
+| 建卡（种类、标题、坐标） | 卡片之间**连线** —— 上游 2026-09-29 已把端口体系下线，画布里没有 `edges` 这个概念了 |
+| **写卡片内容**（场景描述、分镜摘要台词、提示词） | 撤销任何一步 |
+| **建完之后改标题** | 把卡片转成 `canvas_text` —— 那是文本工具专有的类型 |
+| **换节点类型**（`entity_prop` / `gen_image` / `script_input` …） | 建卡时直接指定 `type` —— 见下 |
+| 移动、删除、选中 | |
+| 缩放平移、打开面板 | |
+
+#### 写内容这条路是怎么打开的
+
+上游命令面只有 8 个动作，`add_card` 只认 `kind` / `title` / 坐标，所以**模型能摆卡片，却写不进任何
+内容** —— 建出来的卡是空的。而画布其实有这些字段（每种类型各带一份 `defaultData`），只是命令面没开。
+
+我们没有去改上游仓库，而是在 `build/overlay/src/dsh-commands.ts` 里**抢在画布注册处理器之前把
+`window.nexusvaultMcp.onCommand` 包一层**：认得的动作自己办，不认得的原样转交画布。上游一行没动。
+
+两处关键约束，改这个文件前必须知道：
+
+- **Vue Flow 的 store 只能在组件里拿。** `useVueFlow()` 在组件外调用会 `inject` 不到、于是新建一个
+  **空 store**（`@vue-flow/core` 的实现如此）。所以它由 `main.ts` 的根组件在 `setup()` 里调好再传进来 ——
+  根组件 `provide` 的那份会被 `CanvasView` `inject` 到，于是我们手里的**就是画布正在用的那份**。
+  真机上验证过：`window.__dshExtended.nodeCount()` 与画布上的卡片数一致；不一致就说明这里坏了。
+- **改 `build/overlay/**` 之后必须 `npm run build`。** overlay 是覆盖到镜像 `build/src/` 上的，
+  不重建就只活在源码里。
+
+#### 为什么没有 `connect`
+
+原计划里列过"卡片之间连线"。**做不了，也不该做**：上游 2026-09-29 已把端口体系整体下线
+（`canvas/persistence.ts` 的存档格式里 `edges` 字段直接丢弃，`CanvasView.vue` 全篇零 `addEdges`）。
+画布不再是"有向节点图"，而是"素材墙 + 工作板" —— 卡片之间的关系改由**拖进创作板**与
+**提示词里 @ 提及**表达，两者都落在 `card.data.refs`。往不存在的结构上加连线，只会写出没人读的数据。
+
+同理，**建卡时指定 `type` 也走不通**：命令层只透传 `kind`，而 `CanvasView` 的
+`commandContext.addCard` 又把入参重建成 `{kind, title, x, y}` —— **两道都掐掉了**。
+所以换成"先建一张，再 `set_card_type` 转过去"。好在 `CanvasCardNode.vue` 里写着
+「节点类型恒为 `canvasCard`，`card.type` 保持唯一真源」，改类型等价于直接建。
+另外 **`kind: 'board'` 本来就是分镜卡（`storyboard_shot`）** —— 分镜不用转，容易看漏。
+
+顺带两个实测出来的落位行为，工具层已经挡掉了一半：
+
+- **只给 `x` 或只给 `y` 时，真画布会把另一个轴设成 0**（`Yt()` 里 `x??0, y??0`），卡片会跑到画布
+  最上面一行。现在 `canvas_add_card` 要求坐标成对，缺一个就直接报错而不是替它猜。
+- **都不给时的自动排位只有 3×3=9 格**（`Mt++ % 9`），第十张会绕回与第一张重叠；而且那九个格位是
+  围着**视口中心**转的，不是固定坐标。连着建多张卡时请先 `canvas_get` 取一张参照卡，自己往下排。
 
 ## 架构
 
@@ -217,7 +309,7 @@ audio → asset_input（并写入 data.media_type = 'audio'）
 ### 穷举而不是逐个补
 
 这项工作一度靠截图驱动：打到哪改到哪，改完不知道还剩多少。现在反过来 —— 写脚本把上游
-画布 CSS **全量**过一遍再对着覆盖层比（`.workbuddy/verify/scan-dark-gap.mjs`）：
+画布 CSS **全量**过一遍再对着覆盖层比（`tools/verify/scan-dark-gap.mjs`）：
 
 | 维度 | 扫哪些属性 | 阈值（相对亮度） | 为什么是这个方向 |
 |---|---|---|---|
@@ -281,10 +373,10 @@ icon.svg / locale/           图标与词典
 build/                       真画布的构建工程（见上）
 lib/
   config.js                  配置模式（超时、轮询挂起、队列上限、自动开面板）
-  bridge.js                  命令桥：排队、只交付一次、结算、超时、会话限定
+  bridge.js                  命令桥：排队、只交付一次、结算、超时（冷热两档）、会话限定、自检状态
   routes.js                  /api/dsh-canvas/* HTTP 面
   embed.js                   embed 静态托管（同源 + 路径逃逸防护）
-  tools.js                   9 个 Agent 工具
+  tools.js                   12 个 Agent 工具 + 参数收敛（批量与单命令共用同一份）
   protocol.js                与真画布对齐的契约常量（附真源指针）
   embed/
     canvas-transport.js      DSH 长轮询 ⇄ window.nexusvaultMcp（构建时被内联进 index.html）
@@ -293,11 +385,11 @@ lib/
     assets/                  JS / CSS / 字体分包（构建产物，不入库）
     library-assets/          资产库演示图（构建时 copy-static 搬入）
 tools/
-  smoke-test.mjs             38 项冒烟测试（Node 里跑完整链路）
+  smoke-test.mjs             56 项冒烟测试（Node 里跑完整链路，含对构建产物的契约断言）
   preview-server.mjs         独立预览（不依赖 DSH）
   dev-install.ps1            同步进某个 profile
   sync-all.ps1               同步进所有相关 profile
-.workbuddy/verify/           验证脚本（含覆盖率与卫生两条穷举扫描，随测试一起跑）
+  verify/                    随测试一起跑的两条穷举扫描（覆盖率与卫生），见 smoke-test 的 B10
 docs/接入方案.md              完整的接入方案与决策依据
 docs/验证-*.png              实测截图
 ```
@@ -305,7 +397,7 @@ docs/验证-*.png              实测截图
 ## 开发
 
 ```bash
-npm test                          # 38 项冒烟测试
+npm test                          # 56 项冒烟测试
 cd build && npm run build         # 构建画布（sync → copy-static → vite → install-embed）
 node tools/preview-server.mjs 8791    # 独立预览，不依赖 DSH
 ```
@@ -323,7 +415,15 @@ node tools/preview-server.mjs 8791    # 独立预览，不依赖 DSH
 - localStorage 存档跨浏览器重启存活
 - 六档视口宽度零重叠
 - 主题三态：浅色 / 深色两档全量扫描无残留
-- 38/38 冒烟测试通过
+- 56/56 冒烟测试通过（E 组直接读 `lib/embed/` 的构建产物；E1/E3/E6/E7 与 D6/G1 都做过变异验证 ——
+  改动产物或源码的字符串后，对应断言确实变红，不是"永远绿"的空断言）
+- 挂起式哨兵：无命令时挂住、命令到时立刻返回、游标追上后不再忙答（F1）
+- 冷/热两档超时：冷路径不按常速超时，关掉自动打开则回到常速（F2 / F3）
+- `/status` 的 `host` 字段读到的是宿主半的实时引用，不是快照（F4）
+- **扩展命令端到端**（无头浏览器 + 预览服务，走真实的 `/dispatch` 链路）：
+  `add_card` 建分镜卡 → `set_card_data` 写摘要台词 → `set_card_type` 换成 `gen_text` →
+  `update_card` 改标题 → `get_canvas` 读回，全部落在真画布上；
+  `__dshExtended.nodeCount()` 与画布卡片数一致（证明 Vue Flow store 是共用那份）
 
 **尚未做的：**
 
@@ -331,6 +431,10 @@ node tools/preview-server.mjs 8791    # 独立预览，不依赖 DSH
 - 画布项目管理页**能用**（真画布自带，顶栏「我的画布」进入），但没有从 DSH 侧直达的入口
 - 跨会话隔离：现在所有会话共用一份 localStorage 存档
 - 项目管理页（`#/app/projects`）的卡片未做主题适配
+- **上游源码没有锁版本。** `build/tools/sync-upstream.mjs` 默认读 `_recon/cnb-repo` 这个
+  克隆的 HEAD，README 的安装步骤也没指定 commit —— 也就是说**重新构建可能产出一块不一样
+  的画布**。E 组测试（对构建产物的契约断言）会在合约真的被改坏时报警，但它是事后发现，
+  不是事前锁定。要彻底解决得加一份 `build/upstream.lock`（含每个同步文件的 SHA256）。
 
 ![命令闭环](docs/验证-真画布命令闭环.png)
 ![画布项目管理页](docs/验证-项目页.png)

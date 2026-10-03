@@ -25,6 +25,7 @@ import { createBridge } from '../lib/bridge.js';
 import { registerInfiniteCanvasRoutes, ROUTE_PREFIX } from '../lib/routes.js';
 import { resolveEmbedPath, EMBED_ROOT } from '../lib/embed.js';
 import { buildToolDefinitions, resolveSessionId } from '../lib/tools.js';
+import { CANVAS_COMMAND_ACTIONS, CANVAS_EXTENDED_ACTIONS, NODE_TYPES } from '../lib/protocol.js';
 import {
     CARD_KINDS,
     NODE_TYPE_FOR_KIND,
@@ -202,6 +203,9 @@ function modelHandlers(model) {
     }
     return handlers;
 }
+
+/** 睡一小会儿：超时类的断言要用它制造"还没到点"的时刻。 */
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 /** 等到条件成立（带上限），用于等异步的命令交付。 */
 async function waitFor(predicate, timeoutMs = 2_000) {
@@ -912,7 +916,7 @@ test('B10 主题三态：首帧落 data-dsh-theme、桥接 --dsw-* token、画�
          */
         const { checkOverlayHygiene } = await import(
             // ⚠️ Windows 下动态 import 的绝对路径必须转成 file:// URL（`D:` 会被当协议）
-            pathToFileURL(resolve(ROOT, '.workbuddy/verify/check-overlay-hygiene.mjs')).href
+            pathToFileURL(resolve(ROOT, 'tools/verify/check-overlay-hygiene.mjs')).href
         );
         const raw = readFileSync(resolve(ROOT, 'build/overlay/src/dsh-shell.css'), 'utf8');
         const { problems } = checkOverlayHygiene(raw);
@@ -934,7 +938,7 @@ test('B10 主题三态：首帧落 data-dsh-theme、桥接 --dsw-* token、画�
          *   维度二 浅色文字（不透明、亮度 > 0.75）→ 白底上直接隐形
          */
         const { scanGap } = await import(
-            pathToFileURL(resolve(ROOT, '.workbuddy/verify/scan-dark-gap.mjs')).href
+            pathToFileURL(resolve(ROOT, 'tools/verify/scan-dark-gap.mjs')).href
         );
         const gap = scanGap();
         const fmt = (list) => list.slice(0, 8).map((r) => `  ✗ ${r.file}  ${r.prop}: ${r.lit}  ${r.sel}`).join('\n');
@@ -1244,14 +1248,15 @@ test('C12 卸载时等待中的命令立刻失败，不会挂到超时', async (
 const identity = (definition) => definition;
 const execInSession = (id) => ({ agent: { session: { header: { id } } } });
 
-test('D1 注册 9 个工具，名字与画布动作对得上', async () => {
+test('D1 注册 12 个工具，名字与画布动作对得上', async () => {
     const h = await harness();
     try {
         const tools = buildToolDefinitions(identity, h.bridge);
         assert.deepEqual(tools.map((tool) => tool.name).sort(), [
-            'canvas_add_card', 'canvas_delete_card', 'canvas_get', 'canvas_move_card',
-            'canvas_open_panel', 'canvas_ping', 'canvas_run_agent', 'canvas_select_card',
-            'canvas_set_view',
+            'canvas_add_card', 'canvas_batch', 'canvas_delete_card', 'canvas_get',
+            'canvas_move_card', 'canvas_open_panel', 'canvas_ping', 'canvas_run_agent',
+            'canvas_select_card', 'canvas_set_card_type', 'canvas_set_view',
+            'canvas_update_card',
         ]);
         for (const tool of tools) {
             assert.equal(typeof tool.description, 'string');
@@ -1343,6 +1348,485 @@ test('D5 会话标识从 exec.agent.session.header 解析；拿不到就当没�
     assert.equal(resolveSessionId({}), null);
     assert.equal(resolveSessionId(undefined), null);
     assert.equal(resolveSessionId(execInSession('   ')), null);
+});
+
+/**
+ * 写内容那两个工具的参数校验。
+ *
+ * 为什么单独一条：`canvas_update_card` 有**两种用法**（只改标题 / 只写内容 /
+ * 一起改），是最容易出偏的一个工具。三条要卡住：
+ *   ① `data` 传数组要被当成"没给"而不是塞进画布；
+ *   ② title 和 data 都不给要报错 —— 跑完了什么都没变，不如现在说清楚；
+ *   ③ `canvas_set_card_type` 必须拒掉 `canvas_text` 这类不开放转换的类型，
+ *      否则模型会拿到一张改不动的字。
+ *
+ * 假浏览器这里补了三条**我们自己**的动作（镜像契约里没有，所以
+ * `modelHandlers()` 不带它们），把"参数对不对"和"动作能不能跑"分开验。
+ */
+test('D6 写内容工具的参数校验：数组 data、空调用、不开放的类型都要被挡住', async () => {
+    const model = createModel({ fit: () => {} });
+    const h = await harness();
+    const browser = new FakeBrowser(h.base, {
+        handlers: {
+            ...modelHandlers(model),
+            update_card: (params) => ({
+                id: params.id,
+                title: params.title ?? '原标题',
+                kind: 'note',
+                type: 'note',
+            }),
+            set_card_type: (params) => ({
+                id: params.id,
+                type: params.type,
+                kind: 'text',
+                title: '原标题',
+            }),
+        },
+    }).start();
+    try {
+        const tools = Object.fromEntries(buildToolDefinitions(identity, h.bridge).map((t) => [t.name, t]));
+        const exec = execInSession('s1');
+
+        await assert.rejects(
+            () => tools.canvas_update_card.execute({}, exec),
+            /参数 id 必须是数字/,
+        );
+        await assert.rejects(
+            () => tools.canvas_update_card.execute({ id: 1 }, exec),
+            /至少要给 title 或 data/,
+        );
+        // 数组不是"业务字段"，塞进去会把卡片的 data 换成数组 —— 必须挡掉。
+        await assert.rejects(
+            () => tools.canvas_update_card.execute({ id: 1, data: [1, 2] }, exec),
+            /至少要给 title 或 data/,
+        );
+        await assert.rejects(
+            () => tools.canvas_set_card_type.execute({ id: 1, type: 'canvas_text' }, exec),
+            /不支持的节点类型/,
+        );
+        await assert.rejects(
+            () => tools.canvas_set_card_type.execute({ id: 1, type: 'group' }, exec),
+            /不支持的节点类型/,
+        );
+
+        const written = await tools.canvas_update_card.execute({ id: 1, title: '新标题' }, exec);
+        assert.match(written, /已更新卡片 #1「新标题」/);
+
+        const converted = await tools.canvas_set_card_type.execute({ id: 1, type: 'entity_prop' }, exec);
+        assert.match(converted, /已换成 entity_prop/);
+    } finally {
+        browser.stop();
+        await h.close();
+    }
+});
+
+/* ══ E 产物契约 ═════════════════════════════════════════════════════════
+ *
+ * A 组测的是 `lib/embed/canvas-commands.js` —— 那是我们自己抄的**契约镜像**，
+ * 构建产物一次都不引用它（`index.html` 里出现 0 次）。后果是：上游把动作改名、
+ * 把 `kind` 的投影换掉之后，A 组照样全绿，而真画布的行为早就变了 ——
+ * 等到有人在对话里发现「模型说的东西画布不认」，已经晚了半年。
+ *
+ * 这一组把方向掉过来：**直接读 `lib/embed/` 的构建产物**。契约漂移会被这里挡住，
+ * 而不是被重试三次的人工排查发现。
+ */
+
+/**
+ * 读**命令面所在的那个 chunk**。
+ *
+ * 为什么不是把 `assets/*.js` 拼成一整段来断言 —— 那样做会被救回来：同一个类型名
+ * 常常出现在别的文件里（比如 `_plugin-vue_export-helper` 也带 `--dsw-static-*`
+ * 全套类型），只要还有一处，这条断言就是绿的，而真正的契约早搬家了。
+ * 契约在哪，就查哪。
+ *
+ * 判定办法不看文件名（带 hash，会变），看特征：同时定义了全部 8 个动作的那个
+ * 文件。压缩器爱怎么写 `case` 不重要 —— 名字对得上就够了。
+ */
+function readCommandSurface() {
+    const dir = resolve(ROOT, 'lib/embed/assets');
+    if (!existsSync(dir)) return null;
+    const files = readdirSync(dir).filter((name) => name.endsWith('.js'));
+    for (const name of files) {
+        const text = readFileSync(resolve(dir, name), 'utf8');
+        const hits = CANVAS_COMMAND_ACTIONS.filter((action) => text.includes(action)).length;
+        if (hits === CANVAS_COMMAND_ACTIONS.length) return { name, text };
+    }
+    return null;
+}
+
+/**
+ * 入口 chunk —— `index.html` 里那个 `assets/index-<hash>.js`。
+ *
+ * 它和「命令面 chunk」**不是同一个**，而查产物常量时两边都得看：
+ * Vite 会把被多处共用的模块提到入口里。实测过一次 —— 我们的 overlay 静态
+ * `import` 了 `canvas/types/card`（为了拿 `kindForNode`）之后，`MIN_ZOOM` 就从
+ * CanvasView chunk 挪进了入口 chunk，E5 于是假失败了一次。
+ * 那次入口 chunk 只涨了 113 字节，不是回归，是查找位置写窄了。
+ */
+function readEntryChunk() {
+    const html = readBuiltIndex();
+    const match = /assets\/(index-[A-Za-z0-9_-]+\.js)/u.exec(html);
+    if (match === null) return { name: '(入口 chunk 未找到)', text: '' };
+    const file = resolve(ROOT, 'lib/embed/assets', match[1]);
+    return existsSync(file)
+        ? { name: match[1], text: readFileSync(file, 'utf8') }
+        : { name: match[1], text: '' };
+}
+
+/** 入口页。`index.html` 里内联着传输层，所以它也是产物的一部分。 */
+function readBuiltIndex() {
+    const file = resolve(ROOT, 'lib/embed/index.html');
+    return existsSync(file) ? readFileSync(file, 'utf8') : '';
+}
+
+/** 取命令面，顺手把"压根没构建"这个最常见的前提说清楚。 */
+function requireCommandSurface() {
+    const surface = readCommandSurface();
+    assert.notEqual(surface, null, 'lib/embed 里找不到命令面 —— 先跑一次 `cd build && npm run build`');
+    return surface;
+}
+
+test('E1 产物的命令面：8 个动作一个都不能少', () => {
+    const { name, text } = requireCommandSurface();
+    for (const action of CANVAS_COMMAND_ACTIONS) {
+        assert.ok(text.includes(action), `${name} 里找不到动作 \`${action}\` —— 上游的命令面变了`);
+    }
+});
+
+test('E2 产物的 get_canvas：模型要读的字段名都还在', () => {
+    // 这几个字段是 `lib/tools.js` 里 formatCanvas 直接读的，改一个就少一列。
+    const { name, text } = requireCommandSurface();
+    const head = /return\{nodes:[^}]{0,400}/u.exec(text);
+    assert.notEqual(head, null, `${name} 里没找到 get_canvas 的返回语句 —— 契约搬了家`);
+    for (const field of ['nodes:', 'strokes:', 'viewport:', 'selectedIds:', 'activePanel:']) {
+        assert.ok(head[0].includes(field), `get_canvas 的返回里少了 \`${field}\``);
+    }
+});
+
+test('E3 产物的节点类型表：7 个 kind 的落点都对得上', () => {
+    const { name, text } = requireCommandSurface();
+    for (const type of [
+        'entity_scene', 'entity_character', 'note',
+        'gen_text', 'storyboard_shot', 'gen_video', 'asset_input',
+    ]) {
+        assert.ok(text.includes(type), `${name} 里找不到节点类型 \`${type}\``);
+    }
+});
+
+test('E4 传输层与画布在产物里真的握上了手', () => {
+    // 两端都提到同一个名字，这段握手才算成立：只有一边说话是接不上的。
+    assert.ok(readBuiltIndex().includes('nexusvaultMcp'), '入口页没有内联传输层（nexusvaultMcp 不见了）');
+    const { name, text } = requireCommandSurface();
+    assert.ok(text.includes('nexusvaultMcp'), `${name} 不再使用 nexusvaultMcp —— 换传输线要先改这一组`);
+});
+
+test('E5 产物的缩放上下限与协议写的一致', () => {
+    const surface = requireCommandSurface();
+    const entry = readEntryChunk();
+    // 两个 chunk 一起看：共用模块会被 Vite 提到入口里，只查一个会假失败。
+    const text = `${surface.text}\n${entry.text}`;
+    const where = `${surface.name} + ${entry.name}`;
+    // 压缩后 `0.25` 会被写成 `.25`，所以两种写法都认。
+    const lower = `${MIN_ZOOM}`.replace(/^0/u, '');
+    assert.ok(text.includes(lower), `${where} 里找不到缩放下限 ${MIN_ZOOM}（写作 \`${lower}\`）`);
+    assert.ok(text.includes(`${MAX_ZOOM}`), `${where} 里找不到缩放上限 ${MAX_ZOOM}`);
+});
+
+/**
+ * 我们补的那三条动作**必须真的进了产物**。
+ *
+ * 这不是废话：它们住在 `build/overlay/src/dsh-commands.ts` 里，而 overlay 要
+ * **`npm run build` 之后**才会被铺进 `build/src/` 参与构建。改了 overlay 忘了
+ * 重建，源码里看得到、产物里没有，而页面照常能开 —— 症状是模型说"我改不动
+ * 卡片"，得查半天。E1 验的是上游那 8 条，这一条验的是我们自己这几条。
+ */
+test('E6 产物的扩展命令面：我们补的三条动作都进了产物', () => {
+    const entry = readEntryChunk();
+    for (const action of CANVAS_EXTENDED_ACTIONS) {
+        assert.ok(
+            entry.text.includes(action),
+            `${entry.name} 里找不到扩展动作 ${action} —— 多半是改了 build/overlay/ 忘了 npm run build`,
+        );
+    }
+    // 排障把手也在：真机上量「store 是不是画布那份」全靠它。
+    assert.ok(entry.text.includes('__dshExtended'), `${entry.name} 里找不到 __dshExtended 排障把手`);
+});
+
+/**
+ * 节点注册表里一共有几个 schema 类型。
+ *
+ * 真源 `build/overlay` 镜像过来的 `apps/web/src/canvas/nodes/registry.ts` 的
+ * `NODE_SCHEMAS`（2026-10-03 数是 13）。上游加一个节点类型时这里会红 ——
+ * 那是**故意的**：新增类型意味着 `set_card_type` 要重新决定开不开放它。
+ */
+const EXPECTED_NODE_SCHEMA_COUNT = 13;
+
+/**
+ * 宿主侧的 `NODE_TYPES` 必须和产物里的节点注册表对得上。
+ *
+ * `canvas_set_card_type` 的参数枚举来自 `lib/protocol.js`（手抄的副本），
+ * 真源在产物里。两边一旦分叉，模型会拿到一个画布不认的类型，而报错要等它
+ * 真的调一次才看得见 —— 所以在这里钉死：协议里列的每一个类型，产物里都得有。
+ */
+test('E7 宿主侧 NODE_TYPES 与产物注册表对得上', () => {
+    const surface = requireCommandSurface();
+    const entry = readEntryChunk();
+    const text = `${surface.text}\n${entry.text}`;
+    const where = `${surface.name} + ${entry.name}`;
+    for (const type of NODE_TYPES) {
+        assert.ok(text.includes(type), `${where} 里找不到节点类型 ${type}`);
+    }
+    // 注册表里的类型总数（13）= 能转的（NODE_TYPES）+ 三个不进面板的。
+    // 少了说明注册表变了我们没跟上，多了说明混进了不该出现的别名。
+    const excluded = ['canvas_text', 'group', 'region'];
+    for (const type of excluded) {
+        assert.ok(text.includes(type), `${where} 里找不到被排除的类型 ${type}（它应在注册表里，只是不开放转换）`);
+    }
+    assert.equal(
+        NODE_TYPES.length + excluded.length,
+        EXPECTED_NODE_SCHEMA_COUNT,
+        `注册表类型数对不上：协议 ${NODE_TYPES.length} + 排除 ${excluded.length} ≠ ${EXPECTED_NODE_SCHEMA_COUNT}`,
+    );
+});
+
+/* ══ F 挂起式等待与冷路径 ═════════════════════════════════════════════════
+ *
+ * 这两件事都是为了同一件更大的事：**模型发出的第一条命令不该失败**。
+ *
+ * 挂起式等待把「命令到达 → 面板打开」之间的平均 1.25 秒空耗降到一次往返；
+ * 冷路径预算则承认「得先把面板唤醒、再把 iframe 拉起来」比「画布已经在那儿等着」
+ * 慢一个量级。两者叠起来，"画布没开时的第一次操作"才有了活路。
+ */
+
+test('F1 挂起式 /status：来了命令立刻回，没来就挂在服务端', async () => {
+    const h = await harness({ bridge: { sentinelHoldMs: 500, commandTimeoutMs: 3_000 } });
+    try {
+        // ① 没有更新的命令：请求必须被留在服务端，而不是立刻退回。
+        let started = Date.now();
+        let res = await request(`${h.base}/status?hold=1&since=5`);
+        assert.ok(Date.now() - started >= 400, `应当挂住约 500ms，实际 ${Date.now() - started}ms`);
+        assert.equal(res.status, 200);
+
+        // ② 派一条命令：请求要立刻回来，而且命令还得在队列里。
+        void h.bridge.dispatch('ping', {}).catch(() => {});
+        started = Date.now();
+        res = await request(`${h.base}/status?hold=1&since=0`);
+        assert.ok(Date.now() - started < 400, '命令一产生就该立刻回答');
+        assert.equal(res.json.queued.length, 1, '看一眼不等于取走');
+
+        // ③ 游标已经追上、队列里那条还是旧的：必须继续挂住。
+        //    这条挡的是热循环 —— 服务端若「队列非空就回答」，两边会互相追着打。
+        started = Date.now();
+        await request(`${h.base}/status?hold=1&since=${res.json.seq}`);
+        assert.ok(Date.now() - started >= 400, '没有新命令时不该立刻回答');
+    } finally {
+        await h.close();
+    }
+});
+
+test('F2 冷路径：画布从未连上时，命令拿到更长的超时', async () => {
+    const h = await harness({ bridge: { commandTimeoutMs: 200, coldCommandTimeoutMs: 700 } });
+    // 开了自动打开才值得等：面板会被唤醒，命令还有机会被取走。
+    h.bridge.autoOpenPanel = true;
+    try {
+        const waiting = h.bridge.dispatch('get_canvas', {});
+        await sleep(350);
+        assert.equal(h.bridge.status().pending.length, 1, '命令还在等 —— 冷路径不该按常速超时');
+        assert.equal(h.bridge.status().queued.length, 1);
+        await assert.rejects(() => waiting, /从未连接过/);
+    } finally {
+        await h.close();
+    }
+});
+
+test('F3 关掉自动开面板时冷路径不生效 —— 等下去没有意义', async () => {
+    const h = await harness({ bridge: { commandTimeoutMs: 200, coldCommandTimeoutMs: 5_000 } });
+    try {
+        assert.equal(h.bridge.autoOpenPanel, false, 'harness 的缺省');
+        await assert.rejects(() => h.bridge.dispatch('get_canvas', {}), /超时（200 ms）/);
+    } finally {
+        await h.close();
+    }
+});
+
+test('F4 /status 带出宿主半的挂载情况，且必须是引用', async () => {
+    const h = await harness();
+    try {
+        // 宿主半还没交过来时是 `null`：不是 undefined，也不是替它猜一个对象。
+        assert.equal((await request(`${h.base}/status`)).json.host, null);
+
+        const state = { web: false, webAttempts: 0, tools: { registered: false, names: [], reason: 'not attempted' } };
+        h.bridge.setHostState(state);
+        assert.equal((await request(`${h.base}/status`)).json.host.web, false);
+
+        // 引用语义是这里的重点：两半都是懒绑定的，同一份对象后面还会改。
+        // 存快照的话 /status 会永远停在注册之前的样子，那还不如不查。
+        state.web = true;
+        state.tools.names.push('canvas_get');
+        const host = (await request(`${h.base}/status`)).json.host;
+        assert.equal(host.web, true, '引用丢了的话这里还停在 false');
+        assert.deepEqual(host.tools.names, ['canvas_get']);
+    } finally {
+        await h.close();
+    }
+});
+
+test('F5 挂起的请求被中断后，服务端照常服务下一个', async () => {
+    const h = await harness({ bridge: { sentinelHoldMs: 400 } });
+    try {
+        const controller = new AbortController();
+        const abandoned = request(`${h.base}/status?hold=1&since=99`, { signal: controller.signal });
+        await sleep(60);
+        controller.abort();
+        await Promise.allSettled([abandoned]);
+
+        const res = await request(`${h.base}/status`);
+        assert.equal(res.status, 200, '客户端断开不能把这条路由弄坏');
+    } finally {
+        await h.close();
+    }
+});
+
+/* ══ G 幂等与批量 ═══════════════════════════════════════════════════════════
+ *
+ * 这两个能力对应的是同一句实话：**命令走的是网络，超时不等于没执行。**
+ *
+ * 幂等键让"重投一次"变成安全动作；批量让"改一处要往返一趟"变成一次往返。
+ * 少了前一件事，模型不敢在拿不到回执时重试；少了后一件事，铺一批卡片要十几次
+ * 往返，中途断一次就留下半截状态。
+ */
+
+/** 造一套工具，测试里按名字取用。 */
+function toolMap(bridge) {
+    return Object.fromEntries(buildToolDefinitions(identity, bridge).map((tool) => [tool.name, tool]));
+}
+
+test('G1 幂等键：重投拿回上一次的结果，画布不会被要求执行第二次', async () => {
+    const h = await harness();
+    const model = createModel();
+    const browser = new FakeBrowser(h.base, { handlers: modelHandlers(model) }).start();
+    try {
+        await waitFor(() => h.bridge.status().browser.polls > 0);
+        const tools = toolMap(h.bridge);
+
+        const first = await tools.canvas_add_card.execute(
+            { kind: 'scene', title: '雨夜街口', clientToken: 'tok-1' }, execInSession('s1'));
+        const second = await tools.canvas_add_card.execute(
+            { kind: 'scene', title: '雨夜街口', clientToken: 'tok-1' }, execInSession('s1'));
+
+        assert.equal(second, first, '同一把钥匙必须拿回同一份结果');
+        assert.equal(browser.seen.length, 1, `画布只该收到 1 条 add_card，实际 ${browser.seen.length} 条`);
+        assert.equal(model.cards.length, 1);
+
+        // 换一把钥匙就是一次真正的新建 —— 幂等不是"以后都不许建了"。
+        await tools.canvas_add_card.execute(
+            { kind: 'scene', title: '雨夜街口', clientToken: 'tok-2' }, execInSession('s1'));
+        assert.equal(browser.seen.length, 2);
+        assert.equal(model.cards.length, 2);
+    } finally {
+        browser.stop();
+        await h.close();
+    }
+});
+
+test('G2 幂等键不记住失败 —— 失败之后重投要能真的重来', async () => {
+    // 没有浏览器接命令，所以必然超时。
+    const h = await harness({ bridge: { commandTimeoutMs: 250 } });
+    try {
+        const tools = toolMap(h.bridge);
+        await assert.rejects(
+            () => tools.canvas_add_card.execute({ clientToken: 'tok-x' }, execInSession('s1')),
+            /超时/,
+        );
+        // 第二次必须真的再入队一次，而不是立刻拿回上一次的失败。
+        const again = tools.canvas_add_card.execute({ clientToken: 'tok-x' }, execInSession('s1'));
+        await waitFor(() => h.bridge.status().queued.length === 1, 1_000);
+        await assert.rejects(() => again, /超时/);
+    } finally {
+        await h.close();
+    }
+});
+
+test('G3 add_card 的坐标必须成对 —— 真画布会把缺的那个轴置 0', async () => {
+    const h = await harness({ bridge: { commandTimeoutMs: 3_000 } });
+    const browser = new FakeBrowser(h.base, { handlers: modelHandlers(createModel()) }).start();
+    try {
+        await waitFor(() => h.bridge.status().browser.polls > 0);
+        const tools = toolMap(h.bridge);
+        for (const args of [{ x: 900 }, { y: 200 }]) {
+            await assert.rejects(
+                () => tools.canvas_add_card.execute(args, execInSession('s1')),
+                /x 和 y 必须成对提供/,
+                `只给 ${Object.keys(args)[0]} 必须被挡下`,
+            );
+        }
+        // 两个都给、两个都不给，都该放行。
+        await tools.canvas_add_card.execute({ x: 900, y: 200 }, execInSession('s1'));
+        await tools.canvas_add_card.execute({}, execInSession('s1'));
+    } finally {
+        browser.stop();
+        await h.close();
+    }
+});
+
+test('G4 批量：顺序执行，中途失败就停，并说清做到了第几步', async () => {
+    const h = await harness({ bridge: { commandTimeoutMs: 3_000 } });
+    const model = createModel();
+    const browser = new FakeBrowser(h.base, { handlers: modelHandlers(model) }).start();
+    try {
+        await waitFor(() => h.bridge.status().browser.polls > 0);
+        const tools = toolMap(h.bridge);
+
+        await assert.rejects(
+            () => tools.canvas_batch.execute({ steps: [] }, execInSession('s1')),
+            /steps 不能为空/,
+        );
+
+        const report = await tools.canvas_batch.execute({
+            steps: [
+                { action: 'add_card', params: { title: 'a' } },
+                { action: 'add_card', params: { title: 'b' } },
+                { action: 'delete_card', params: { id: 999 } },
+                { action: 'add_card', params: { title: 'c' } },
+            ],
+        }, execInSession('s1'));
+
+        assert.match(report, /失败 1/);
+        assert.match(report, /找不到指定卡片/);
+        assert.ok(!report.includes('「c」'), '失败之后不该继续往下做');
+        assert.equal(model.cards.length, 2, '前两步已经落盘，第三步失败 —— 画布没有撤销这一步');
+
+        // 开了 continueOnError 就把剩下的做完，失败原因照样列出来。
+        const lenient = await tools.canvas_batch.execute({
+            continueOnError: true,
+            steps: [
+                { action: 'delete_card', params: { id: 999 } },
+                { action: 'add_card', params: { title: 'd' } },
+            ],
+        }, execInSession('s1'));
+        assert.match(lenient, /失败 1/);
+        assert.ok(lenient.includes('「d」'), 'continueOnError 时后面的步骤仍要执行');
+        assert.equal(model.cards.length, 3);
+    } finally {
+        browser.stop();
+        await h.close();
+    }
+});
+
+test('G5 批量不收 get_canvas：中途要读就用 canvas_get', async () => {
+    const h = await harness({ bridge: { commandTimeoutMs: 3_000 } });
+    const browser = new FakeBrowser(h.base, { handlers: modelHandlers(createModel()) }).start();
+    try {
+        await waitFor(() => h.bridge.status().browser.polls > 0);
+        const tools = toolMap(h.bridge);
+        const report = await tools.canvas_batch.execute({
+            steps: [{ action: 'get_canvas', params: {} }],
+        }, execInSession('s1'));
+        assert.match(report, /不支持的动作/);
+    } finally {
+        browser.stop();
+        await h.close();
+    }
 });
 
 /* ── 跑 ─────────────────────────────────────────────────────────────────── */
